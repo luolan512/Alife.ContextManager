@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Context Studio · Alife</title>
+  <link rel="stylesheet" href="./app.css?v=20260930p" />
+</head>
+<body>
+  <div class="titlebar">
+    <div class="tb-left tb-drag"><span class="logo">✦</span><span>Context Studio</span></div>
+    <div class="tb-center tb-drag"><span id="statusText">初始化</span><i id="statusDot" class="dot"></i></div>
+    <div class="tb-right no-drag">
+      <button id="minBtn" title="最小化"><i class="ic-min"></i></button>
+      <button id="maxBtn" title="最大化"><i class="ic-max"></i></button>
+      <button id="closeBtn" title="关闭"><i class="ic-close"></i></button>
+    </div>
+  </div>
+
+  <div class="studio">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="sidebar-mark">✦</span><div><b>Context Studio</b><small>上下文管理台</small></div>
+      </div>
+      <nav id="navList" class="sidebar-nav" aria-label="工作区"></nav>
+      <div class="sidebar-bottom">
+        <button id="newCharacterBtn" class="btn wide">新建角色</button>
+        <button id="importTavernBtn" class="btn primary wide">导入酒馆资源</button>
+      </div>
+    </aside>
+    <section class="workspace">
+      <div id="pageHead" class="page-head"></div>
+      <div id="pageBody" class="page-body"></div>
+    </section>
+    <aside id="inspector" class="inspector"></aside>
+  </div>
+
+  <div id="presetDrawer" aria-live="polite"></div>
+  <div id="modalRoot"></div>
+  <!-- 不要用 document.write 注入本脚本：实测 Chromium/Electron 下 document.write 写入的
+       外链 script 可能完全不加载，页面会没有任何脚本、所有按钮失效。
+       这里保持静态 script 标签，并在每次改动 app.js 时递增 v 以绕过缓存。 -->
+  <script src="./app.js?v=20260930p"></script>
+</body>
+</html>
