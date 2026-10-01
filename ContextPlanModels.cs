@@ -24,6 +24,16 @@ public sealed class ContextPlanModule
     public bool Selective { get; set; }
     public bool CaseSensitive { get; set; }
     public int TargetIndex { get; set; } = -1;
+    /// <summary>
+    /// 这个 framework 模块锚定的那条实时消息的**身份指纹**（见 <see cref="ContextItem.AnchorKey"/>）。
+    ///
+    /// <para>
+    /// <see cref="TargetIndex"/> 是「它在 ChatHistory 数组里的第几位」——会随历史裁剪而失效；
+    /// 本字段是「它是哪一条消息」——不会。装配时优先用它找消息，找不到才退回 <see cref="TargetIndex"/>。
+    /// 空字符串表示这是一个老的、还没锚定过的模块（首次匹配成功时会自动补上并落盘）。
+    /// </para>
+    /// </summary>
+    public string AnchorKey { get; set; } = "";
     public string OriginalContent { get; set; } = "";
     public string OriginalRole { get; set; } = "system";
 

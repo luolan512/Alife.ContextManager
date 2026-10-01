@@ -46,6 +46,7 @@ public sealed class ContextPlanService
         {
             var plan = JsonConvert.DeserializeObject<ContextPlan>(File.ReadAllText(path)) ?? new ContextPlan();
             if (plan.Modules == null) plan.Modules = new List<ContextPlanModule>();
+            ContextPromptText.NormalizeFrameworkNames(plan.Modules);
             return plan;
         }
         return readIndexJson(owner)?["ContextManagerPlan"]?.ToObject<ContextPlan>() ?? CreateDefaultPlan(owner);

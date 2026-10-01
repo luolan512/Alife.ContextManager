@@ -5,7 +5,6 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -86,15 +85,371 @@ public sealed partial class ContextManagerRuntime
     //       8841 行，里面还留着更早构建号的 boot 行）。现在前端自己按 512 KB 封顶，
     //       超了就只留后半段重写 —— 与后端 ContextTrace 的 600 KB 上限同一套做法。
     //       顺带把「每条日志一次 statSync」省掉：起始大小只量一次，之后自己累加字节数。
-    //    ② `Release()`（插件卸载）以前不摘 `LanguageModel.ContextTransform`。那个委托是闭包，
-    //       捕获了 activity 与运行时实例。插件重载而模型存活时：新运行时因为属性非空而挂不上
-    //       （插件覆盖静默失效，trace 里只有 attached=false），旧运行时还被闭包引用着回收不掉。
+    //    ② `Release()`（插件卸载）以前不摘请求前重排的委托。那个委托是闭包，
+    //       捕获了会话与运行时实例。插件重载而会话存活时：新运行时判定“已挂”而不再挂
+    //       （插件覆盖静默指向旧实例），旧运行时还被闭包引用着回收不掉。
     //       `DetachTransforms()` 早就写好了却没人调用，现在在 Release 里补上。
+    //       （第三十二轮起，摘除对象从 LanguageModel.ContextTransform 换成官方 ChatBot.ChatSent。）
     //    ③ 删掉 `int references;` —— 全项目只声明、从未读写。
     // 其余部分审计结论是**不会累积**：出站队列有界（256 条，满则丢新）、
     // 窗口/定时器在关窗与卸载时逐个释放、state 每次整份替换旧对象可回收、
     // 且界面全程是 DOM/CSS，没有 WebGL/canvas/video —— 显存占用恒定（只有一个窗口的合成开销）。
-    public const string AppBuild = "cm-app-2026-09-30-p";
+    // q：① **开放角色侧接口**（本轮）：插件第一次真正成为「角色能用」的插件 ——
+    //       以前它只有界面，角色完全不知道它存在。现在加 `XmlFunctionCaller` 依赖
+    //       （manifest 声明 Alife.Function.FunctionCaller，否则裸 Roslyn 编译时
+    //       `Alife.Function` 命名空间根本不存在 —— 见 4.5.0 的 CS0234 教训），
+    //       由 `ContextAgentApi` 注册 11 个函数：3 个只读（列目录 / 读正文 / 预览）、
+    //       3 个增删改、4 个快照（列出 / 保存 / 删除 / 切换）、1 个「应用」。
+    //       拆三层：`ContextAgentOps`（纯逻辑，与界面共用同一份计划文件）、
+    //       `ContextAgentGuard`（准入 + 审批）、`ContextAgentApi`（函数外壳）。
+    //    ② 配置页加两个总开关（`AllowModifySelf` / `AllowModifyOthers`，默认都关）：
+    //       关着时 `BuildPrompt()` 返回空串，提示词里连「你有这个能力」都不出现。
+    //       开着时也只放行「读」，每一次**写**仍然要用户在弹窗里点批准。
+    //    ③ 修「配置页看不到任何配置项」：`ModuleDetailView.razor` 的规则是
+    //       「有自定义 editorUI 就不再渲染自动表单」—— 本插件的 `ContextManagerUI`
+    //       以前只画按钮、从不渲染 `DefaultUI`，所以 `OverrideMode` 等字段**从未在
+    //       配置页露出过**。现在显式 `builder.AddContent(N, DefaultUI)`。
+    //    ④ 修 `ContextAgentOps.NormalizeGroup` 的值域错误（测试抓到）：合法区域只有
+    //       `system / features / memory / chat`（`ContextCompiler.Groups`），
+    //       以前却用了 `user / assistant`，任何一次「新增模块」都会在
+    //       `Validate` 抛「无效的模块区域」。现在把「身份」当「区域」说的输入统一折算，
+    //       非法值兜底归 `system`。
+    //    ⑤ 修 `ContextAgentOpsResult.With` 冲掉失败原因：失败结果补上下文时原先是**替换**
+    //       Message，把 `Fail("没有传任何要修改的字段")` 覆盖成「模块 Id：…」，
+    //       角色只能看到补充信息、看不到为什么失败。现在失败时改为「原因 + 补充」。
+    // r：① **删掉逐次审批**（用户决定）。原先角色每改一次上下文都要用户在弹窗里点批准，
+    //       与「配置页那两个开关」重复 —— 开关开着本身就是用户对信任的表达，
+    //       已经做过一次的决定不该每次重问。现在只剩两处例外仍然会问（见 `ContextAgentGuard`）：
+    //       跨角色**装插件**、以及**本地覆盖**（不可逆）。改自己永远安静。
+    //    ② 连带取消「应用时询问用插件覆盖还是本地覆盖」：改自己一律插件覆盖（不动角色文件），
+    //       改别人时若要走本地覆盖，在①那个弹窗里一次问清（多了个「不用插件」勾选框）。
+    //    ③ **清理配置页五个死字段**：`OverrideMode` / `ActivePreset` / `UseCharacterCard` /
+    //       `UseWorldBook` / `ApplyMacros`。它们全是 `ContextOverrideBuilder` 那条
+    //       **已死路径**的输入 —— 那条路径唯一的入口 `ApplyOverride` 在 IPC 分派表里
+    //       根本没有登记，前端也从不发对应消息。也就是说这五个开关改了什么都不会发生。
+    //       其中 `UseCharacterCard` / `UseWorldBook` 还和模块化装配**互相打架**
+    //       （「要不要带世界书」本来就是一个模块的 `Enabled`，两处开关用户不知道谁说了算）。
+    //    ④ 删掉死代码：`ContextOverrideBuilder.cs`（约 300 行）、`ApplyOverride` /
+    //       `GetOverrideBuilder` / `WriteTempOverride` / `ClearOverride` / `SendOverrideState`
+    //       （全部零调用点）。保留 `DeleteTempOverride`（`ContextAssemblyRuntime` 在用它
+    //       清理老路径留下的 `OverrideState/<角色>/context.txt`）。
+    //       角色快照里的「设定来源」改为带上**预设目录下全部预设**（原先只带当时选中的那一份）。
+    // s：**函数文档终于真的注入给 AI 了**（用户指出「具体函数标签文档没给全」）。
+    //       根因：本模块用 `RegisterHandlerWithoutDocument` 注册 = `DocumentMode.None`，
+    //       而 `XmlFunctionCaller.UpdatePrompt()` 只拼接 `explicitHandlers` / `implicitHandlers`，
+    //       `None` **两边都不进** ⇒ 框架永远不会把这 11 个函数写进提示词。
+    //       AI 只能看到手写的口语化能力描述（「能查看、能修改」），
+    //       却不知道函数叫什么、参数叫什么、哪些可选、正文放标签里还是属性里 —— 只能猜。
+    //       修法照抄工具箱（`Marisa.Toolkit`）的同一个位置：把 `handler.FunctionDocument()`
+    //       直接拼进 `BuildPrompt()` 的「## 提供函数」一节。文档由框架从 `[XmlFunction]`
+    //       + `[Description]` + 参数签名**自动渲染**，函数一改文档自动跟着变，不会手写不同步。
+    //       同时补了「## 怎么用」一节（自闭合 vs 包裹写法、转义、编号从哪来）。
+    // t：**「模块名与内容对不上」+ 幽灵模块 + 说明文字**（用户一次报了三件事）。
+    //    ① 模块名/内容错位的根因：framework 模块与实时消息的**配对键是下标**——
+    //       计划里存 `TargetIndex`（= 「它在 ChatHistory 数组里第几位」），前端又靠正则
+    //       从标题里抠 `#N` 反算同一个下标。下标不是身份：对话历史一更新（前部被裁剪、
+    //       中间插入新消息），同一条消息的下标就变了，而计划记的还是旧值 ——
+    //       卡片上的**名字**读的是当前那条消息，**正文**读的却是计划里那条模块，
+    //       于是配到了两条不同的消息。
+    //       修法：给每条实时消息算一个**内容指纹** `AnchorKey`（`ComputeAnchorKey`，
+    //       system 消息用「功能说明名」，其余用正文前缀哈希，**刻意不含下标**）；
+    //       计划模块也带上它。配对时指纹优先，命中不到就认定「这是一条新消息」而不是
+    //       退回下标去复用别人的模块。老计划（没有指纹）仍按下标配对，但命中后会**补写指纹**，
+    //       下次就走稳定路径。涉及：`AddLiveContext` / `AddOfflineHistory` /
+    //       `ContextAssemblyRuntime.PreparePlan` / `ContextCompiler.Compile` /
+    //       前端 `findFrameworkModule`。
+    //    ② 幽灵模块：计划里的 framework 模块以前**只增不减**。插件停用后它注入的
+    //       「功能说明」消息从历史里消失，计划里那条模块却还在、还挂着「参与装配」——
+    //       这正是用户说的「子代理插件的说明怎么一直都在我都没启用」。
+    //       `PreparePlan` 现在会把「锚点已不在当前历史里」的 framework 模块剔掉
+    //       （**只在角色已激活时做**：未激活时历史读不到，照删会把好计划清空）。
+    //    ③ 说明文字：`[Module]` 那句「高效查看角色预设、系统提示词、记忆……」只列了
+    //       「有什么」，没讲「干什么、怎么管」。改成讲清「把这次请求发了什么摊在一条时间线上，
+    //       可逐条增删改 / 排序 / 开关参与装配 / 存快照」。另外窗口导航栏底部加了常驻的
+    //       「怎么用这个插件」——一页讲清三种覆盖方式的区别与装配页操作，
+    //       不必再去翻 README（说明不该藏在仓库里）。
+    //    u：① **「传正文」的函数一律不可用**（用户报：「所有需要传正文的 Add / Update 不能用会报错」）。
+    //       根因：`AgentContextAdd` / `AgentContextUpdate` 声明成了
+    //       `[XmlFunction(FunctionMode.OneShot)]` + 一个 `[XmlContent] string content` 参数。
+    //       但框架的模式校验是**位与**（`XmlHandler.Invoker`）：
+    //         `CallMode` 是自闭合时要求 `(Mode & OneShot) != 0`；
+    //         是包裹时要求 `(Mode & Content) != 0`。
+    //       写成 `OneShot` ⇒ **只允许自闭合**，而自闭合根本装不进正文 ——
+    //       一旦 AI 按唯一能带正文的包裹写法调用，就抛
+    //       「调用 AgentContextAdd 标签的方式错误，应该使用单个自闭合标签调用」。
+    //       另外 `ContentName` 只在 `Mode == FunctionMode.Content` 时才由框架设置，
+    //       所以 `[XmlContent]` 参数在 OneShot 下永远不会被填值 —— 双重报废。
+    //       修法（照抄框架自带的 `Alife.Function.FileService.Write` 与
+    //       `Marisa.AgentCollab.SubAgentSpawn`）：改成 `FunctionMode.Content`，
+    //       收 `XmlExecutorContext context`，正文取 `context.FullContent`
+    //       （**不是** `context.Content` —— 流式解析下 Closing 时它是空的），
+    //       并在开头加 `if (context.CallMode != CallMode.Closing) return;`
+    //       （Content 模式会先触发 Opening/Content 好几次，只有 Closing 才是正文收完）。
+    //       其余 9 个函数是真·无正文（list / read / preview / delete / presets / …），
+    //       继续用 `OneShot` 自闭合，**不要**一起改 —— 改了它们就会要求包裹写法而更糟。
+    //    ② 提示词里的「怎么写」跟着修：原文要求「正文里的 `<` `>` `&` 要写成 `&lt;` …」——
+    //       那是 `[XmlContent]` 时代的约束；现在正文走 `[XmlForm]`/`FullContent`，
+    //       是**原样收下的纯文本**，照旧说明去转义反而会把内容写坏。
+    //       现在改成：**两种写法各自的适用范围**列清楚（哪些只能自闭合、哪两个能包正文）、
+    //       正文「纯文本、不需要转义」、update「不写正文 = 不改正文」。
+    //       文档由框架 `FunctionDocument()` 自动渲染，本来就不会不同步；会不同步的正是
+    //       这种手写的补充说明，所以它必须和实现放在同一个改动里。
+    //    v：① **功能说明仍在移位 / 互相覆盖**（用户第二轮反馈：「功能说明和功能模块还是会出现
+    //       移位问题，而且有的还会被覆盖掉模块里的内容说明」）。
+    //       根因是上一轮的指纹**不够唯一**：对 system 消息只取「功能说明里的模块名」当 token。
+    //       但一个插件可以往历史里插**多条** `[功能说明(XXX)]`（Toolkit 按分层暴露就是每层一条），
+    //       它们的模块名相同 ⇒ 指纹完全相同 ⇒ 配对用 `FirstOrDefault` 永远命中第一条：
+    //          · 第 2、3 条的卡片显示的是第 1 条的正文 → 看起来「移位」；
+    //          · 第 1 条模块的正文被反复取用、后面几条的内容读不出来 → 看起来「被覆盖」。
+    //       修法：token 改成 `name:XXX#hash:abcd…` —— 名字用于**聚类**（同一模块的多条），
+    //       正文哈希用于**区分同一条的前后稳定**。再加 `ComputeUniqueAnchorKeys`：
+    //       整批算指纹，重复的按先后顺序追加 `~1` `~2` 消歧（两条逐字相同的消息也不再撞车）。
+    //       ⚠️ 必须**整批一起算**，逐条各算各的等于没做 —— 调用点在 `AddLiveContext`。
+    //    ② 配对从「取第一条」改成「按序号对齐」：`ResolveFrameworkIndex`（后端）与
+    //       `findFrameworkModule` / `OrdinalOf`（前端与装配侧）现在都会数「这条是历史上
+    //       第几条同源」，再取计划里第几条同源模块。旧格式指纹（没有 `#hash:`）仍然兼容，
+    //       不必让用户重建计划。
+    //    ③ **提示词精简**（用户：「上下文管理的标签的说明也优化一下，废话很多，关键信息不多」）。
+    //       原来的「你能做的事 / 每个函数都是一个 xml 标签 / [可选] 参数可不写」这些都在
+    //       框架自动渲染的函数文档里写着，重复一遍只会稀释真正的约束。现在只留文档里
+    //       **生成不出来**的东西：调用形式（自闭合 vs 开闭包裹）、正文不用转义、
+    //       update 不写正文的含义、编号从哪来、以及「改完必须 apply」。
+    //    w：① **乱序问题仍在**（用户第三次反馈：「不行，乱序问题还是存在」）。
+    //       根因不在指纹，而在 `ContextCompiler.Compile` 的**分段主循环**：它用
+    //         `cursor = 1; while (cursor < N && source[cursor].Role == System) AddSource(cursor++);`
+    //       顺序扫，隐含假设「所有 system 消息连续排在开头」。但 `Interactor.Prompt`
+    //       把插件的功能说明**插在最后一个 system 之后** —— 一旦中途插入，后面的消息
+    //       全部落进错误的分段（装配顺序乱掉）。更早还叠了第二个错：
+    //       `AddSource` 用 `position > 0 && Role == System ? "features" : "chat"` 判归属，
+    //       于是**记忆存档**被判成 features，它在计划里的改写被 `edit.Group != sourceGroup`
+    //       静默丢弃。
+    //       修法（用户选「彻底改成不依赖位置」）：新增纯函数
+    //       `ContextPromptText.SourceGroup(index, role, text)`，**只看消息自身**：
+    //         index 0 且 system → system（角色设定）
+    //         `[功能说明(...)]` 开头 → features
+    //         `[记忆存档(` 开头      → memory
+    //         其余 system           → system（用户自加的 system 模块）
+    //         非 system             → chat
+    //       主循环改成「按区域分桶」：先给每条消息算归属，再按 system→features→memory→chat
+    //       固定顺序输出，桶内保持原有先后。位置怎么变都不影响。
+    //       前端 `frameworkItems` / `frameworkModuleCard` / `frameworkOverride` 同步改用
+    //       `liveGroupOf`（同一套规则），不再靠 `messageIndex(i)>0` 猜。
+    //    ② **AI 找不到上下文管理器的说明**（用户：「我也没找到有用的任何跟上下文管理器
+    //       有关的模块提示词」）。根因是 `RefreshAgentPrompt` 用「开关状态快照」去重 ——
+    //       它假定「调过一次 Prompt()，那段提示词就永远在历史里」。但 `Interactor.Prompt`
+    //       把插入的消息对象缓存在内部字段 `promptContent` 里；那条被别处移走后缓存成
+    //       **孤儿**，再 `Prompt()` 只写孤儿、历史里什么都不会出现。
+    //       修法：改成**幂等对齐** —— 每轮比对「期望的提示词」与「历史里实际那段」
+    //       （`PromptInHistory()` 按 `[功能说明(ContextManagerModule)]` 标题定位，
+    //       不看下标），不一致才写。内容没变时不做任何多余动作。
+    //    ③ **新增导入能力**（用户：「让 ai 可以自己导入角色卡世界书预设之类的」）。
+    //       `AgentContextImport`（order 23，OneShot 自闭合；JSON 走 `json` 属性，
+    //       不塞标签正文 —— 免得整段 JSON 转义错一个字就废）+ `ContextAgentOps.ParseImport`
+    //       （**形状优先于声明**：AI 常把世界书说成「角色卡」，按内容认，矛盾才报错）
+    //       + `ImportModules`（整批追加、名称+正文判重、一次落盘）。
+    //       解析复用既有 `TavernImport`：角色卡 6+2 字段 / 额外开场白 / 卡内世界书 /
+    //       预设 prompts+prompt_order / 世界书三种形状。
+    //       **只解析成模块，不写回角色目录**（用户明确要求）—— 关掉插件即复原。
+    //    x：用户第四次反馈，一次报了三件事，**前两件其实是同一条链上的两个环节**。
+    //    ① **说明还是插不进去**（「你还是没有把上下文管理器的使用说明插入到上下文里，
+    //       我还是没找到对应模块」）。上一轮我把「开关快照去重」改成「幂等对齐」，
+    //       以为修好了 —— 其实**一点用都没有**，因为真正的墙在 `Interactor<T>` 内部：
+    //         · `Prompt()` 只在 `promptContent == null` 时才会去历史里找注入点；
+    //         · `Dispose()` 只把消息 `Remove` 出历史，**不清空 `promptContent` 字段**；
+    //         · 于是 `promptContent` 成了「不在历史里、引用还在」的**孤儿**，
+    //           之后每次 `Prompt()` 都跳过查找、直接往孤儿写 → 历史里永远没有这段说明。
+    //         · 最致命的时序：`OnAwake` 里首次 `BuildPrompt` 可能返回空（Runtime 刚建好、
+    //           配置未应用），于是走了 `Dispose()` 分支 —— **一开机就把唯一的写入通道弄丢**。
+    //       修法：**彻底不走 `Interactor` 的提示词通道**，自己持有 `promptMessage`
+    //       并用 `ChatBot.EditChatHistory` 增删改。判定只看两件事：
+    //         「我自己记着的那个对象还在不在历史里（按引用比对）」+
+    //         「历史里有没有标题行匹配的同类消息（认领上次运行 / 他处留下的）」。
+    //       两者都不看下标，所以重排、裁剪、重启都能自愈。
+    //       同时 `OnDestroy` 也改成自己摘除（`Interactor.Dispose()` 同样不可靠）。
+    //    ② **界面顺序混乱，但打开之后是对的**。这条与①同行：`liveGroupOf` 用
+    //       `messageIndex(i)===0` 判断角色设定，而 `messageIndex` 是**正则从标题里抠 `#N`**。
+    //       那个 `#N` 就是历史下标 —— 对话一变就整体重排，且某些条目（分页补回的老报文）
+    //       可能根本没有 `#N`，退化 `-1` 排到最前。于是列表顺序每次都在漂。
+    //       而「打开之后是对的」正是因为内容配对走的是 `AnchorKey`（不含下标，稳定）。
+    //       修法：`ContextItem` 新增 `LiveOrder`（后端采集时直接赋整数），前端
+    //       `liveOrdinal(i)` 用它排序，**不再解析标题字符串**；`liveGroupOf` 的
+    //       「是不是第 0 条」也改成看 `liveOrdinal`。老报文没有该字段时仍回退 `messageIndex`。
+    //       另外 `sortPlanGroups` 补上**稳定的第二排序键**（原下标）——
+    //       以前同区域内谁先谁后完全交给 `Array.sort` 的实现，看起来就是「模块在乱跳」。
+    //    ③ **角色设定重复出现**（「运行的时候会把角色设定#0 在 Alife 运行时里那一块也出现一块」）。
+    //       计划里那条 native 模块（角色设定 #0）与运行时第 0 条（live-system）是**同一个东西的
+    //       两个视图**，以前在「按来源」视图里同时列出 → 看着像被注入了两次。
+    //       修法：新增 `isRepresentedByPlan(i)`，装配视图**不再单列**运行时的第 0 条
+    //       （它的内容由 native 模块代表；「上下文总览」等地方照常显示，不隐藏）。
+    //    y：用户第五轮反馈（附截图 + 真实上下文），**名字与内容分属两个数据源**。
+    //    ① **提示词明明插进去了，却「看着像没插」**：它被插在「最后一个 system 之后」——
+    //       你的历史里系统消息全在开头，但**其它插件会陆续往中间插**，于是「最后一个 system」
+    //       一直在变，提示词被插到所有系统模块的**最末尾**，离角色设定很远，
+    //       一眼扫过去根本找不到，用户描述为「没插入进去」。
+    //       修法：固定插在**角色设定（第 0 条）之后** —— 前面只有一条消息，没有可漂的余地。
+    //    ② **模块名与内容错乱**（截图：`ContextManagerModule #3` 的内容是 QuickChat 的说明）。
+    //       根因是**标题里的名字依赖位置**：`LiveSystemTitle(text, index)` 的 `index` 是
+    //       「遍历整个 ChatHistory 的全局下标」，而前端 `frameworkDisplayName()` 把尾部 ` #N`
+    //       去掉当模块名 —— 等于**把位置当成了名字**。位置一漂，名字就指认了另一条消息。
+    //       而卡片**内容**走的是 anchorKey 配对（稳定）—— 两个数据源，必然错位。
+    //       修法：① 标题序号改用「**system 消息自己的序号**」（与指纹消歧序号同源），
+    //       真正的位置另由 `LiveOrder` 承载、不塞进标题；
+    //       ② 前端卡片的**名字也取自配对到的模块**（与内容同源），配不到才退回运行时标题。
+    //       > **铁律：同一个用户可见对象的名字与内容，必须来自同一个数据源。**
+    // y：**"提示词根本没插进去"其实是"日志根本写不出去"**。排查时 grep trace.log 搜
+    //    `agent prompt` 零命中，看起来像 RefreshAgentPrompt 没执行 —— 错的。
+    //    `ContextTrace.Write` 在 `Configure(storageRoot)` 之前直接 return，而 `Configure`
+    //    **只在 OpenWindowAsync 里调用** → OnAwake/OnUpdate 这些最关键阶段的日志全被**静默丢弃**；
+    //    框架又把 OnAwake 的异常吃掉只记 AlifeLog（不进 trace）→
+    //    **"插件崩了"和"插件正常"在 trace 里长得一模一样：都没有日志。**
+    //    修法：① ContextTrace 加 `ConfigureFallback`（兜底到插件目录下的 startup-trace.log，
+    //    绝不静默丢弃）；② OnAwake 第一件事就挂兜底目录，并全程留痕
+    //    （start / runtime ok / handler registered / FAILED）；③ RefreshAgentPrompt 五条分支
+    //    各留一条 trace，一次重启就能定位断点；④ OnAwake/OnUpdate 自带 try/catch 落 trace。
+    //    > **教训：`grep 无命中` 只能证明「日志写出来了、里面没这句」，
+    //    > 不能证明「代码没执行」—— 前提是那条日志路径本身是通的。**
+    // z：⭐⭐ **「一个数字被两种语义共用」的彻底清算** —— 用户第六轮截图：
+    //    两张 `VirtualWorldService` 卡片内容一字不差、位置 #4 / #5，且「一个带 #4 一个不带」。
+    //    真因是 **y 之前的第五批只改了一半**：把标题里的 `#N` 从「全局数组下标」改成
+    //    「第几条 system 消息」（对**显示**是对的），**却忘了还有 5 处在拿 `#N` 当数组下标**：
+    //      FillRuntimeSystemModuleContents / ApplyLiveContentEdit / RemoveLiveMessage /
+    //      DeleteHistoryItem / UpdateHistoryContent / ReadFullContent
+    //    两者只在「所有 system 消息恰好连续排在开头」时才相等。角色设定之后一插入消息
+    //    （本插件自己注入的说明就是），就整体错位 →
+    //      ① 卡片正文**张冠李戴**（用错的 N 取到别人的正文）；
+    //      ② 同名模块**看起来重复**（两条消息的 N 落在同一段正文上）；
+    //      ③ **编辑 / 删除会改错、删错那条消息**（数据破坏）。
+    //    修法：**位置与名字彻底分家**。
+    //      · 标题 = **纯名字**（`LiveSystemTitle` 不再拼 `#N`，非 system 消息也改成「角色 · 摘要」）；
+    //      · 位置 = `LiveOrder`（整数），新增 `LiveIndex(item)` 作为**唯一**取下标入口；
+    //      · 所有下标调用点统一改走 `LiveIndex`，删掉 `MessageIndexFromTitle` 这份重复正则；
+    //      · 前端 `liveOrdinal` / `messageIndex` 收敛成**同一个实现**（后者只是别名）。
+    //    > **铁律：一个数字不要承载两种语义**（位置 vs 名字）。分开存、分开读。
+    //    > 推论：凡是「显示序号」被当成「数据下标」用的地方，都要当成**数据破坏级**隐患审一遍。
+    //    > 反面教训：第五批"改一半"比不改更危险 —— 它让显示对了，从而掩盖了数据侧已经错位。
+    // ab：⭐⭐ **读运行时源码后，把「编辑/删除实时消息」从「信下标」改成「验指纹」** ——
+    //    用户第三轮反馈「重复问题依然没解决」，截图里 `VirtualWorldService` 仍是两张
+    //    （#3 576 字 / #4 597 字，字数差 = 两次注入时角色列表不同，即**两次 OnAwake**）。
+    //    读 `Alife.Framework/Models/Module/Interactor.cs` 后确认：
+    //      `Prompt()` 只在 `promptContent == null` 时查找复用，查找条件是
+    //      `Content.StartsWith("[功能说明(VirtualWorldService)]")`；
+    //    而 `ApplyLiveContentEdit` 走的是 `thread.ChatHistory[index].Content = content` ——
+    //    **裸下标**。一旦下标错位（z 之前的历史遗留就是），就会把**别人**的提示词头改掉，
+    //    于是那个插件重建 `Interactor` 后 Find 不到旧消息 → **又插一条** → 重复。
+    //    修法：写入前用 `LiveMessageMatches(history, index, item)` 校验「这条确实是它」——
+    //      · 有 `AnchorKey` → 用与装配计划**同一套** `ComputeAnchorKey` 严格比对；
+    //      · 无指纹（老报文）→ 退化为「正文互为首缀」（Content 可能只是预览）；
+    //      · 不符 → **抛错拒绝**，绝不硬改。删除路径同样校验。
+    //    > **铁律：凡是「用下标定位别人的数据」，写入前必须验一次身份。**
+    //    > 宁可不做，也不能做错 —— 做错会污染第三方插件的注入，且症状延迟出现、极难归因。
+    // ae：⭐⭐ **AI 改了上下文模块，界面却不刷新** —— 补上「落盘后的通知」这条缺掉的路。
+    //    用户反馈：AI 能新增/修改上下文模块，但**管理界面里不实时刷新**，
+    //    **新模块根本不显示**；可是它确实存在（预览里看得见）。
+    //    查证（全部有据）：
+    //      · `Plans/momo.json` 里确实躺着 `测试模块A` / `测试模块B`（agent 来源、enabled、
+    //        UpdatedAt 是几分钟前）——**模块真的写进去了**，不是没写成功；
+    //      · `ContextAgentOps` 是**纯逻辑层**（类注释：不碰 IPC），构造里只有
+    //        `planService`，改完只 `SavePlan`，**拿不到 runtime、发不出报文**；
+    //      · `ContextAgentApi` 的三个写函数（add / update / delete）加上 import、
+    //        切快照，共 **5 条写路径**，全部只落盘、零通知；
+    //      · 界面这侧 `plan-state` / `state` 只在「用户自己保存 / 应用 / 历史被编辑」时推送。
+    //    于是角色改完，磁盘变了，用户盯着的窗口纹丝不动 —— 必须关掉重开才看得到。
+    //    修法：给 `ContextAgentOps` 加第 5 个构造参数 `onPlanChanged`（**由 Runtime 注入**），
+    //      新增唯一落盘出口 `SaveAndNotify`：**先存盘、再通知**，通知抛异常只记日志。
+    //      · 顺序不可颠倒 —— 通知方要读新计划，先通知会读到旧内容；
+    //      · 只在实际改动时通知 —— 读操作（outline / read / preview）与失败的写不通知；
+    //      · 通知失败**绝不能**把已经成功的改动报成失败（窗口没开时就是这种情况）。
+    //      这三条都被 `agent-ops-tests/RefreshRegression.cs` 逐条锁定。
+    //    > **铁律：写数据的层如果发不出通知，就必须把「通知」做成注入的出口，
+    //    > 并且所有写路径共用一个落盘出口 —— 否则迟早漏掉一条路径（这里一次就漏了 5 条）。**
+    //
+    // af：⭐⭐ **「首次改别人成功，之后连给自己加模块都被拦」** —— 配置按角色隔离。
+    //   现场：用户开了「允许角色修改自己/其他角色」两个开关，AI 改别的角色**第一次成功**，
+    //   之后**所有**调用（含给自己加模块）都被回以「用户没有开启「允许角色修改其他角色的上下文」」。
+    //   查证（全部实证）：
+    //     ① 配置是**按角色**存的：`Storage/Character/<角色>/Configuration/Marisa.ContextManager.ContextManagerModule.json`。
+    //        框架 `ChatActivity` 激活模块时按 `character.StorageKey` 逐个注入 `Configuration`
+    //        （源码 `ChatActivity.cs:80-83`，注入发生在 `AwakeAsync` 之前）。
+    //     ② 本项目 **5 个角色**装了本插件：momo（配置 = 两个开关都 true）、伊卡洛斯 / 小梦 /
+    //        星野雨 / 酒狐（**无配置文件** → 框架 `Activator.CreateInstance` 出默认实例 → 两个都 false）。
+    //     ③ **`ContextManagerRuntime` 是全局单例**（`current ??= new ...`），而 `Config` 是单例上的
+    //        **一个**属性。老实现里 `ContextManagerModule.OnUpdate()` **每帧**都调
+    //        `Runtime.ApplyConfig(Configuration)` —— 即把**本角色**的配置写进这个共享槽位。
+    //     ⇒ 只要 momo 之外的任一角色在跑，`Config` 就被冲成全 false，momo 的权限被无声撤销。
+    //        这**完整解释**了「首次成功、之后全拒」以及「连给自己加模块也被拦」（整份 Config 被冲掉）。
+    //   修法（不改任何既有语义，只把「一个槽位」换成「按 owner 查」）：
+    //     · 新增 `ownerConfigs` 字典 + 独立锁 `ownerConfigGate`（不与 stateLock 共用：
+    //       它每帧都写、且不参与任何 IPC 构建，共用锁只会互相蹭）；
+    //     · 新增 `SetOwnerConfig(owner, c)`（模块实例按 `SafeName()` 登记自己那份）与
+    //       `ConfigFor(owner)`（取该角色自己的配置，查不到才回退兜底 `Config`）；
+    //     · **准入判定**改读 `ConfigFor(request.SelfOwner)`（`CheckAgentAccessAsync`）——
+    //       必须用「发起者自己」的配置，不是「最后写进来的那个角色的」；
+    //     · **能力说明**同理改读 `ConfigFor(character.Name)`（`ContextAgentApi.BuildPrompt`），
+    //       否则「AI 忽而知道自己能改、忽而又不知道」会随别人变；
+    //     · 模块侧 `ApplyConfig(Configuration)` → `SetOwnerConfig(SafeName(), Configuration)`（OnAwake + OnUpdate 两处）。
+    //   三条被 `agent-ops-tests` 的 10c.1~10c.10 逐条锁定；变异 `cfgshare` 退回共享槽位即被抓。
+    //    > **铁律：全局单例上不要放「每个实例各不相同」的可变状态。**
+    //    > 配置天然是 per-owner 的；把它摊到共享单例上，就等于让所有角色共用一个开关。
+    //
+    // ag：⭐⭐ **斩断对 OpenAI 插件私有接口 `ContextTransform` 的强依赖**。
+    //   现场：应用计划时被回以「应用失败：当前语言模型没有 ContextTransform 接口，
+    //   请先重载已更新的 OpenAI 语言模型插件。」—— 用户当场质疑「不是你该改什么 OpenAI 语言模型插件啊，
+    //   如果强依附别人的插件，很麻烦的」。
+    //   查证（全部实证）：
+    //     ① **`ContextTransform` 不是官方 API。** Alife 官方源码（`Alife-master`）全库搜零命中；
+    //        官方 `ILanguageModel`（`Alife.Framework/Models/ILanguageModel.cs`）**只有**
+    //        `ChatStreamingAsync(...)` 一个方法，**没有任何请求前钩子**。
+    //        那是**别人**给 OpenAI 插件源码硬加的私有属性（`edit.py` / `permanent-fix.py` 即其遗迹）。
+    //     ② 一旦该插件被回退/替换/换模型，请求前重排整条链路**当场死掉**，还会把错误赖到用户身上
+    //        （提示「请重载插件」）—— 这是「强依附别人插件」的必然恶果。
+    //   修法（改用**官方**挂载点，零第三方依赖）：
+    //     · 挂载对象从 `LanguageModel` 换成 `ChatBot`，从「反射写私有属性」换成「订阅公开事件」：
+    //       `bot.ChatSent += handler`（`ChatBot.cs:36` `public event Action<string>? ChatSent`）。
+    //     · 时序（`ChatBot.ChatAsync`）：`127` 装载用户消息 →`136` `ChatSent?.Invoke()` →`149` 发真请求。
+    //       即：**用户消息已进历史、语言模型请求尚未发出** —— 正是重排的唯一正确窗口。
+    //       `ChatSent` 触发时第 127 行那次 `EditChatHistoryAsync` 已释放 `chatHistorySemaphore`，
+    //       所以回调里同步调 `ChatBot.EditChatHistory(...)`（`ChatBot.cs:75`，public 同步方法）**不死锁**。
+    //     · 重排粒度：`bot.ChatHistory` 是对外**快照**（`IReadOnlyList<ChatMessageContent>`，第 54 行），
+    //       而 `ContextCompiler.Compile` 要 `ChatHistory` —— 先按序拷一份喂编译，再在
+    //       `EditChatHistory` 里「整体替换」（`Clear()` 后按编译结果重填）。
+    //     · 订阅表键从「LanguageModel 对象」换成「ChatBot 对象」（`chatSentSubscriptions` + `chatSentGate`）：
+    //       事件挂在 ChatBot 上，而 LanguageModel 可能在运行时被换（重载插件）→ 挂错对象必漏摘/漏挂。
+    //     · **删掉**「挂不上就抛『没有 ContextTransform 接口』」那段 —— 官方事件任何语言模型都有，
+    //       不存在「接口缺失」；挂不上只记日志，绝不打断对话。
+    //     · `AttachTransform` 返回值改为「是否处于挂载态」，`TryAutoAttach` 不再看 `LanguageModel`。
+    //   三条被冒烟测试锁定（不许再反射 ContextTransform / 必须 `bot.ChatSent += handler` /
+    //   Release 仍摘 `DetachTransforms`）；变异 `chatsent` 退回反射即被抓。
+    //    > **铁律：插件只能依赖官方公开 API。「别人插件里的私有口子」看着能用，**
+    //    > **但对方一升级就断，还会把断的责任推给用户。**
+    //
+    // ah：⭐⭐⭐ **删除审批弹窗 —— 「等用户点弹窗」的准入机制会把整个对话卡死**。
+    //   现场：AI 执行 `AgentContextAdd` 成功后，用户想继续对话，却发现发送通道被一直占住，
+    //   界面上持续显示「执行 AgentContextAdd 函数丨分析对话」，**消息再也发不出去**。
+    //   用户反馈的关键事实：**那个审批弹窗从来没有真正弹出来过**。
+    //   根因：`CheckAgentAccessAsync` 在「跨角色」分支里 `await AskAgentAsync(...)` ——
+    //   后者 `SendWindow("agent-ask", ...)` 后 `await` 一个 `TaskCompletionSource`。
+    //   **弹窗没出现 ⇒ 用户不可能答 ⇒ TCS 永远不 SetResult ⇒ 那次工具调用永久挂起**
+    //   （XmlHandler 的 Invoker 在 await 它），而工具调用不返回，框架的对话轮次就完不成，
+    //   **整个会话的发送通道被这次调用占死**。
+    //   ⚠️ 那个 `while(true) { await Task.WhenAny(tcs.Task, Task.Delay(5000)) }` 轮询是个
+    //      **假保险**：它只在「插件窗口被关掉」时才 break；窗口一直开着但弹窗没显示，
+    //      就永远转下去 —— 看上去"有超时"，实际仍然会永久挂住。
+    //   修法（整体删除，不是修修补补）：
+    //     · **去掉所有「等用户输入」的准入路径**。准入改成**同步方法**
+    //       `string? CheckAgentAccess(AgentRequest, string)` —— 立即返回，不可能挂住。
+    //     · 删除 `AskAgentAsync` / `AnswerAgentAsk` / `pendingAgentAsks` / `agentAskGate` /
+    //       `AgentDecision`；8 个调用点从 `await runtime.CheckAgentAccessAsync(...)` 改同步。
+    //     · 删除后端 `agent-answer` IPC 分支；删除前端 `showAgentAsk` / `answerAgentAsk` /
+    //       `AGENT_RISK_NOTE` / `agent-ask` 弹窗分支（收到旧报文只记 trace，不弹窗）。
+    //     · 权限模型简化成**一道闸**：配置页两个开关。插件覆盖未启用时，
+    //       **改自己、改别人都直接自动启用**（插件覆盖只在请求前重排，不写任何角色文件，
+    //       关掉插件即复原）—— 唯一被改的是插件自己的运行时状态，没有需要征求同意的地方。
+    //   断言：10.4~10.20 与 12.1~12.9 全部反过来钉「不存在任何等用户输入的通道」；
+    //   14.4 钉「后端不再分派 agent-answer」。变异 `approval` 退回 await 即被抓。
+    //    > **铁律：任何「await 用户输入」的准入机制，只要「弹窗真的会出现」这个前提不成立，**
+    //    > **就等价于一个必然卡死的陷阱 —— 卡住的代价是「整个对话不能用」，**
+    //    > **远大于它想防住的风险。准入判定必须同步、立即、可预测。**
+    public const string AppBuild = "cm-app-2026-10-02-ah";
 
     // state 报文的体积预算（字节）。见 ContextStateBudget 的注释：
     // 报文过大（中文被序列化成 \uXXXX 后接近 1 MB）会触发 Socket.IO 的 413 断连，
@@ -117,7 +472,6 @@ public sealed partial class ContextManagerRuntime
     readonly ILogger logger;
     ContextWindowService? windowService;
     readonly object stateLock = new();
-    ContextOverrideBuilder? overrideBuilder;
     bool activationHooked;
     ContextPlanService? planService;
     readonly object historySubscriptionLock = new();
@@ -131,6 +485,50 @@ public sealed partial class ContextManagerRuntime
     volatile string focusedOwner = "";
 
     public ContextManagerConfig Config { get; private set; } = new();
+
+    // ⭐⭐ 按角色（owner）登记的配置。
+    //
+    // 为什么必须有这个（2026-10-01 现场）：
+    //   `ContextManagerRuntime` 是**全局单例**，而 `Config` 是单例上的**一个**属性。
+    //   但配置是**按角色**存的（`Storage/Character/<角色>/Configuration/Marisa.ContextManager.ContextManagerModule.json`），
+    //   每个装了插件的角色都有一份自己的 `Configuration`。
+    //   老实现里 `OnUpdate()` **每帧**把本角色的 `Configuration` 写进共享的 `Config` ——
+    //   于是「谁最后跑谁说了算」。本项目有 5 个角色装了插件（momo 开了权限，另外 4 个没配
+    //   → 默认两个开关都是 false），只要 momo 之外的任一角色在跑，`Config` 就会被冲成全 false，
+    //   momo 后续所有调用（**连给自己加模块**）都被拒 —— 正是用户报的「首次成功后全被拦」。
+    //
+    // 修法：**配置按 owner 查，不共享一个槽位**。`Config` 只作为「查不到时的兜底」。
+    readonly Dictionary<string, ContextManagerConfig> ownerConfigs = new(StringComparer.OrdinalIgnoreCase);
+    // 配置字典有**自己的**锁，不与 stateLock 共用：
+    //   · 它不参与任何 IPC 数据构建，没有「持锁发送」的风险；
+    //   · 且 OnUpdate 每帧都会写它 —— 若与 stateLock 共用，会和「锁内构建快照」互相蹭。
+    readonly object ownerConfigGate = new();
+
+    /// <summary>登记某个角色的插件配置（由该角色的模块实例在自己的 OnAwake / OnUpdate 里调用）。</summary>
+    public void SetOwnerConfig(string? owner, ContextManagerConfig? c)
+    {
+        if (c == null) return;
+        var key = owner ?? "";
+        lock (ownerConfigGate) ownerConfigs[key] = c;
+        // 兼容旧行为：兜底值也跟着更新（这样即使 owner 名对不上也有可用的默认）。
+        Config = c;
+    }
+
+    /// <summary>
+    /// 取某个角色**自己**的配置。查不到该角色的专属配置时回退到兜底 <see cref="Config"/>。
+    /// <para>角色的准入判定必须用「发起者自己」的配置，而不是「最后写进来的那个角色的」。</para>
+    /// </summary>
+    public ContextManagerConfig ConfigFor(string? owner)
+    {
+        lock (ownerConfigGate)
+        {
+            if (!string.IsNullOrWhiteSpace(owner) && ownerConfigs.TryGetValue(owner!, out var c)) return c;
+            return Config;
+        }
+    }
+
+    /// <summary>兼容保留：把配置记为兜底值（不再作为唯一来源）。改用 <see cref="SetOwnerConfig"/>。</summary>
+    public void ApplyConfig(ContextManagerConfig? c) { if (c != null) { Config = c; } }
 
     ContextManagerRuntime(CharacterSystem characterSystem, ChatActivitySystem chatActivitySystem,
         StorageSystem storageSystem, PluginSystem pluginSystem, ModuleSystem moduleSystem, ILogger logger)
@@ -485,7 +883,62 @@ public sealed partial class ContextManagerRuntime
         ContextTrace.Write($"plan inline skipped owner={owner} planBytes={planBytes} limit={PlanJsonInlineLimit}（改由 plan:get 下发）");
     }
 
-    public void ApplyConfig(ContextManagerConfig? c) => Config = c ?? new ContextManagerConfig();
+    // ── 角色侧接口（2026-10-01 新增）──────────────────────────────────────
+    // 角色通过 XmlHandler 调进来的操作层。它和界面共用同一个 ContextPlanService
+    // 与同一份计划文件 —— 两条入口的落地动作必须一致，否则界面和角色的认知会分叉。
+    ContextAgentOps? agentOps;
+
+    /// <summary>角色侧操作层。首次访问时按当前运行时状态构建（Storage 根目录要运行时才拿得到）。</summary>
+    internal ContextAgentOps AgentOps => agentOps ??= new ContextAgentOps(
+        GetPlanService(),
+        ReadIndexOrNull,
+        RenderPlanForAgent,
+        GetCharacterPresetDirectory(),
+        // 第 5 个参数 = 「计划落盘了」的通知口。角色改完上下文后，界面那一侧不会自己知道，
+        // 必须在这里把新计划推回窗口，否则用户看到的一直是旧样子（见 NotifyPlanChangedFromAgent）。
+        NotifyPlanChangedFromAgent);
+
+    /// <summary>ReadIndex 会抛异常（角色目录不存在 / index.json 坏了）；角色侧用不到异常，一律降级成 null。</summary>
+    JObject? ReadIndexOrNull(string owner)
+    {
+        try { return ReadIndex(owner); }
+        catch (Exception ex) { ContextTrace.Write($"agent read index failed owner={owner}: {ex.Message}"); return null; }
+    }
+
+    /// <summary>
+    /// 把计划渲染成最终报文（供角色「预览」用）。
+    /// 走的是与真实请求同一条 <see cref="ContextCompiler.Compile"/>，
+    /// 只是历史消息用空的 —— 角色想看的是「上下文部分长什么样」，不是它正在聊的那轮对话。
+    /// </summary>
+    string RenderPlanForAgent(string owner, ContextPlan plan)
+    {
+        var index = ReadIndexOrNull(owner);
+        var warnings = new List<string>();
+        var history = new Microsoft.SemanticKernel.ChatCompletion.ChatHistory();
+        // Off（关闭）模式下 Compile 会原样返回传入的 history —— 而这里传的是空 history，
+        // 角色就会看到「什么都没有」。它想看的是「如果装配会发什么」，所以按 Temporary 渲染
+        // （与界面「预览」按钮的处理完全一致，见 PreviewPlan）。
+        var mode = plan.Mode;
+        if (plan.Mode == "Off") plan.Mode = "Temporary";
+        try
+        {
+            var messages = ContextCompiler.Compile(history, plan, index, owner, warnings);
+            var sb = new System.Text.StringBuilder();
+            if (mode == "Off")
+                sb.AppendLine("（当前覆盖方式是「关闭」，下面是假设启用插件覆盖时会发出的内容）").AppendLine();
+            foreach (var message in messages)
+            {
+                sb.Append('【').Append(ContextCompiler.Role(message.Role.Label)).Append("】\n");
+                sb.AppendLine(message.Content);
+                sb.AppendLine();
+            }
+            foreach (var warning in warnings)
+                sb.AppendLine("（提示）" + warning);
+            return sb.ToString().Trim();
+        }
+        finally { plan.Mode = mode; }
+    }
+
     public void Release()
     {
         chatActivitySystem.Activated -= OnActivityActivated;
@@ -497,15 +950,21 @@ public sealed partial class ContextManagerRuntime
                 if (historySubscriptions.Remove(activity.ChatBot, out var callback)) activity.ChatBot.ChatHistoryEdited -= callback;
             historyRefreshTimer?.Dispose(); historyRefreshTimer = null;
         }
-        // ⚠️ 必须把挂在 LanguageModel.ContextTransform 上的委托摘掉。
+        // ⚠️ 必须把挂在 ChatBot.ChatSent 上的委托摘掉。
         //
-        // 那个委托是闭包，捕获了 activity 和本实例（this）。插件被重载时 OnDestroy → Release，
-        // 如果模型对象活得比插件长（重载插件而不重启 Alife），旧委托就留在模型上：
-        //   1) 新运行时的 AttachTransform 会因为 `property.GetValue(model) != null` 直接返回，
-        //      插件覆盖从此静默失效（trace 里只会看到 attached=false）；
+        // 那个委托是闭包，捕获了 ChatBot 和本实例（this）。插件被重载时 OnDestroy → Release，
+        // 如果 ChatBot 活得比插件长（重载插件而不重启 Alife），旧委托就留在会话上：
+        //   1) 新运行时的 AttachTransform 会因为字典里已有该 bot 而判定“已挂”，
+        //      实际挂在上面的是**旧运行时**的委托 —— 插件覆盖从此指向被回收的实例；
         //   2) 旧运行时被这个闭包引用着，回收不掉 —— 每重载一次泄漏一份。
-        // 原来 DetachTransforms() 写了却没人调用（见 ContextAssemblyRuntime.cs）。
+        //
+        // 第三十二轮之前这里摘的是 LanguageModel.ContextTransform（别人给 OpenAI 插件加的口子），
+        // 现在换成官方事件，摘除对象同步改成 ChatBot。
         try { DetachTransforms(); } catch (Exception ex) { ContextTrace.Write("detach transforms failed: " + ex.Message); }
+        // 2026-10-02：这里以前要「把待批审批请求全部叫醒（视为拒绝）」——
+        // 那套「await 用户弹窗」的机制已被整体删除（它会导致工具调用永久挂住对话），
+        // 所以这段收尾也没有存在意义了。
+        agentOps = null;
         current = null; windowService?.Dispose(); windowService = null;
     }
 
@@ -531,6 +990,8 @@ public sealed partial class ContextManagerRuntime
             else if (type == "worldbook:entry") GetWorldBookEntry(JsonString(payload, "owner") ?? "", payload);
             else if (type == "tavern:import") ImportTavernCard();
             else if (type == "card-worldbook-answer") AnswerUiAsk(payload);
+            // 2026-10-02：「agent-answer」（审批弹窗的回答）分支已删除 ——
+            // 审批机制整体移除，前端也不再发这个报文。旧报文进来只有下面 else 的「忽略」日志。
             else if (type == "import:options") SendImportOptions(JsonString(payload, "owner") ?? "");
             else if (type == "import:options-save") SaveImportOptionsFromUi(JsonString(payload, "owner") ?? "", payload);
             else if (type == "tavern:import-preset") ImportTavernPreset();
@@ -705,7 +1166,22 @@ public sealed partial class ContextManagerRuntime
     void AddLiveContext(ChatActivity activity, string owner, bool memoryEnabled, List<ContextItem> items, int previewChars = 0)
     {
         var history = activity.ChatBot.ChatHistory;
+        // 身份指纹：下标会变、内容不会。前端拿它当 framework 模块的配对键（比 #N 可靠）。
+        // ⚠️ 必须**整批一起算**：同一个模块可以注入多条「功能说明」（Toolkit 按分层暴露就是
+        // 每层一条），它们的模块名相同 —— 逐条各算各的会让指纹撞车，配对时
+        // FirstOrDefault 永远命中第一条，后面几条卡片就串位/互相覆盖。
+        // ComputeUniqueAnchorKeys 会对重复指纹按先后顺序追加 ~1 / ~2 消歧。
+        var anchors = ContextPromptText.ComputeUniqueAnchorKeys(history
+            .Select((message, i) => (
+                message.Role == AuthorRole.System ? "live-system" : "live-history",
+                message.Role.Label,
+                message.Content,
+                message.Role == AuthorRole.System && i == 0))
+            .ToList());
         var index = 0;
+        // system 消息自己的序号（0 = 角色设定）。**不能**用全局 index：
+        // 那个是「遍历 ChatHistory 的计数器」，位置一漂标题里的名字就跟着漂（见 LiveSystemTitle）。
+        var systemOrdinal = 0;
         foreach (var message in history)
         {
             var role = message.Role.Label;
@@ -714,8 +1190,12 @@ public sealed partial class ContextManagerRuntime
             var text = message.Content ?? "";
             int level = 0;
             var title = isSystem
-                ? LiveSystemTitle(text, index)
-                : $"{role} #{index}";
+                ? LiveSystemTitle(text, systemOrdinal)
+                // ⚠️ 非 system 消息（user / assistant）的标题**同样不带 #N**：
+                // `#N` 早已不再是「数组下标」（见 LiveIndex 的注释），留在标题里只会诱导
+                // 别人再去解析它。位置一律走 LiveOrder。
+                // 角色名 + 正文摘要给用户看，比一个会漂的数字有用得多。
+                : $"{role} · {ShortPreview(text)}";
             var category = isSystem
                 ? "功能说明"
                 : (TryParseMemory(text, out level)
@@ -745,6 +1225,11 @@ public sealed partial class ContextManagerRuntime
                 UpdatedAt = DateTime.Now
             };
             item.Id = StableId(owner, "live", role, index.ToString());
+            item.AnchorKey = anchors.TryGetValue(index, out var anchor) ? anchor : "";
+            // 显示次序：给前端一个**整数**，免得它去解析标题里的 #N（见 ContextItem.LiveOrder 注释）。
+            // 只用于排序，不参与身份配对。
+            item.LiveOrder = index;
+            if (isSystem) systemOrdinal++;
             items.Add(item);
             index++;
         }
@@ -1152,8 +1637,10 @@ public sealed partial class ContextManagerRuntime
     {
         var path = GetHistoryPath(item.Owner);
         var arr = JArray.Parse(File.ReadAllText(path));
-        // 按该角色历史条目顺序定位：Title 形如 user #3
-        var index = ExtractHistoryIndex(item.Title);
+        // ⚠️ 用 LiveIndex，**不要**再 ExtractHistoryIndex(item.Title)：
+        // 标题早已不带 #N（见 LiveSystemTitle 的注释），解析标题会永远返回 -1 →
+        // 「无法定位 History.json 条目」，而且以前还会拿错位的 N 去改**别人**那一条。
+        var index = LiveIndex(item);
         if (index < 0 || index >= arr.Count) throw new InvalidOperationException("无法定位 History.json 条目");
         arr[index]["Content"] = content;
         File.WriteAllText(path, arr.ToString(Formatting.Indented));
@@ -1163,7 +1650,8 @@ public sealed partial class ContextManagerRuntime
     {
         var path = GetHistoryPath(item.Owner);
         var arr = JArray.Parse(File.ReadAllText(path));
-        var index = ExtractHistoryIndex(item.Title);
+        // ⚠️ 同样是数据破坏高风险点：拿错位的下标会把**别的消息**删掉。必须用 LiveIndex。
+        var index = LiveIndex(item);
         if (index < 0 || index >= arr.Count) throw new InvalidOperationException("无法定位 History.json 条目");
         arr.RemoveAt(index);
         File.WriteAllText(path, arr.ToString(Formatting.Indented));
@@ -1190,15 +1678,61 @@ public sealed partial class ContextManagerRuntime
         File.WriteAllText(path, arr.ToString(Formatting.Indented));
     }
 
+    /// <summary>
+    /// ⚠️ <b>历史遗留：从标题尾部抠 <c>#N</c>。</b>只在**标题里那个 N 确实是数组下标**的
+    /// 场景才可以用 —— 也就是 <c>LiveOrder</c> 字段存在之前的**老报文**兜底。
+    ///
+    /// <para><b>不要再在新代码里用它取 ChatHistory / History.json 的下标</b>，
+    /// 请用 <see cref="LiveIndex"/>。原因见那个方法的注释（这是一次真实的翻车）。</para>
+    /// </summary>
     static int ExtractHistoryIndex(string title)
     {
         var match = Regex.Match(title, @"#(\d+)$");
         return match.Success ? int.Parse(match.Groups[1].Value) : -1;
     }
 
+    /// <summary>
+    /// 取一条实时条目在 <c>ChatBot.ChatHistory</c> / <c>History.json</c> 里的**真实数组下标**。
+    ///
+    /// <para><b>⚠️ 这是一次真实的翻车，别改回去。</b></para>
+    ///
+    /// <para>第五批修复把「实时 system 消息的标题序号」从「遍历 ChatHistory 的<b>全局下标</b>」
+    /// 改成了「<b>system 消息自己的序号</b>」（即 <c>LiveSystemTitle(text, systemOrdinal)</c>）——
+    /// 那个改动对<b>显示</b>是正确的（名字不该随位置漂），但它**悄悄弄坏了下标**：</para>
+    ///
+    /// <list type="number">
+    /// <item>标题里 <c>#N</c> 的 N 从此是「第几条 system 消息」，**不再是数组下标**；</item>
+    /// <item>而 <c>FillRuntimeSystemModuleContents</c> / <c>ApplyLiveContentEdit</c> /
+    /// <c>DeleteHistoryItem</c> / <c>UpdateHistoryItem</c> / <c>ReadFullContent</c> 全都
+    /// 还在 <c>ExtractHistoryIndex(item.Title)</c> 拿它当**下标**用。</item>
+    /// </list>
+    ///
+    /// <para>两者只在「所有 system 消息恰好连续排在开头」时才相等。一旦角色设定之后插入了
+    /// 消息（本插件自己注入的说明就是），就全部错位 —— 表现为：</para>
+    /// <list type="bullet">
+    /// <item>卡片**内容张冠李戴**（用错的 N 去取 ChatHistory，取到别人的正文）；</item>
+    /// <item>同名模块**重复出现**（两条 system 消息取到同一段内容，看起来就是「重复」）；</item>
+    /// <item><b>更严重</b>：编辑 / 删除会**改错、删错那条消息** —— 数据破坏。</item>
+    /// </list>
+    ///
+    /// <para><b>现在的规则：位置只从 <c>LiveOrder</c> 取，标题里不再放 <c>#N</c>。</b>
+    /// 身份（名字）与位置彻底分开。老报文没有 <c>LiveOrder</c>（默认 -1）时才退回解析标题。</para>
+    /// </summary>
+    static int LiveIndex(ContextItem item)
+    {
+        if (item.LiveOrder >= 0) return item.LiveOrder;
+        return ExtractHistoryIndex(item.Title);   // 老报文兜底（那时 #N 确实是下标）
+    }
+
     // 编辑「实时上下文 / 原始记忆流」条目 = 直接改写 ChatHistory 里那一条消息。
     // 这里以前失败是静默 return：用户点了保存、界面刷新后又变回旧内容，看起来就是
     // “原始记忆流不能修改”。现在改成抛出明确原因，让界面能说清为什么没写进去。
+    //
+    // ⚠️⚠️ 定位必须走**指纹**（AnchorKey），不能只信下标 —— 这是一次真实的翻车，
+    // 起因就是「用错位的下标去改历史」把**别的插件**（VirtualWorldService）注入的
+    // system 提示词改掉了：那条消息一旦不再以 `[功能说明(VirtualWorldService)]` 开头，
+    // VirtualWorldService 重建 Interactor 时就 Find 不到它，于是**又插一条** →
+    // 用户看到的就是「同一个模块出现两次」。见 AnchorKey 与 ResolveFrameworkIndex 的注释。
     void ApplyLiveContentEdit(ContextItem item, string content)
     {
         var activity = FindActivity(item.Owner);
@@ -1206,18 +1740,31 @@ public sealed partial class ContextManagerRuntime
             throw new InvalidOperationException($"角色「{item.Owner}」当前未激活，无法改写实时上下文。请先激活该角色再编辑。");
         var index = item.SourceKey == "character-prompt"
             ? 0
-            : ExtractHistoryIndex(item.Title);
+            // ⚠️ 必须用 LiveIndex（LiveOrder），不能解析标题：标题已不带 #N。
+            : LiveIndex(item);
         if (index < 0)
-            throw new InvalidOperationException($"无法定位这条实时消息（标题「{item.Title}」里没有可用的序号）。");
+            throw new InvalidOperationException($"无法定位这条实时消息（没有可用的位置信息）。");
         var written = false;
+        var mismatch = false;
         activity.ChatBot.EditChatHistory(thread =>
         {
+            // ① 指纹校验：确认「第 index 条」确实是我们要改的那条。不是就**拒绝**，
+            //    绝不改错 —— 宁可让用户刷新重试，也不能破坏别人的注入内容。
+            if (index >= 0 && index < thread.ChatHistory.Count
+                && !LiveMessageMatches(thread.ChatHistory, index, item))
+            {
+                mismatch = true;
+                return;
+            }
             if (index >= 0 && index < thread.ChatHistory.Count)
             {
                 thread.ChatHistory[index].Content = content;
                 written = true;
             }
         }, "ContextManager 编辑上下文");
+        if (mismatch)
+            throw new InvalidOperationException(
+                "这条消息在对话历史里的位置已经变了（前后被增删/压缩过），为避免改错别的消息，本次编辑已取消。请刷新后重试。");
         if (!written)
             throw new InvalidOperationException(
                 $"实时上下文当前只有 {activity.ChatBot.ChatHistory.Count} 条，序号 #{index} 已经不存在（对话可能被压缩或截断过）。请刷新后重试。");
@@ -1227,12 +1774,47 @@ public sealed partial class ContextManagerRuntime
     {
         var activity = FindActivity(item.Owner);
         if (activity == null) return;
-        var index = ExtractHistoryIndex(item.Title);
+        // ⚠️ 同 ApplyLiveContentEdit：这是**删除**路径，用错下标会删掉不该删的那条
+        // （删掉 VirtualWorldService 的提示词不会立刻有症状，但会诱发它重复注入）。
+        var index = LiveIndex(item);
         if (index <= 0 || index >= activity.ChatBot.ChatHistory.Count) return;
+        if (!LiveMessageMatches(activity.ChatBot.ChatHistory, index, item)) return;
         activity.ChatBot.EditChatHistory(thread =>
         {
-            thread.ChatHistory.RemoveAt(index);
+            if (index < thread.ChatHistory.Count && LiveMessageMatches(thread.ChatHistory, index, item))
+                thread.ChatHistory.RemoveAt(index);
         }, "ContextManager 删除上下文");
+    }
+
+    /// <summary>
+    /// 校验历史里第 <paramref name="index"/> 条消息，就是界面上的 <paramref name="item"/>。
+    ///
+    /// <para><b>判定顺序（越靠后越松，只有全都不成立才判「不是」）：</b></para>
+    /// <list type="number">
+    /// <item>有条目指纹就用指纹严格比对（<see cref="ContextPromptText.ComputeAnchorKey"/>，
+    /// 与装配计划里的配对用的是同一套算法）；</item>
+    /// <item>没有指纹（老报文 / 磁盘条目）时，退化成「角色一致 + 正文一致」——
+    /// 只做**相等**判断，绝不做「包含 / 前缀」这类模糊匹配。</item>
+    /// </list>
+    ///
+    /// <para>为什么不干脆只比正文：正文本身就是用户要改的东西，改完就不相等了；
+    /// 这里的调用发生**在写入之前**，比的是「写之前那条是不是它」，所以等值比对是安全的。</para>
+    /// </summary>
+    bool LiveMessageMatches(IReadOnlyList<ChatMessageContent> history, int index, ContextItem item)
+    {
+        var message = history[index];
+        if (item.AnchorKey.Length > 0)
+        {
+            return ContextPromptText.HistoryAnchors(history)[index] == item.AnchorKey;
+        }
+        // 没有指纹：退化成「正文比对」。⚠️ item.Content 可能只是**预览**（报文超预算时被
+        // PreviewLimit 截断，见 BuildLiveContext 里的赋值），所以**不能要求完全相等** ——
+        // 改成「二者互为首缀」：任一为空则判否（无信息量，宁可不动）。
+        var actual = message.Content ?? "";
+        var shown = item.Content ?? "";
+        if (shown.Length == 0) return false;
+        return actual.StartsWith(shown, StringComparison.Ordinal)
+            || shown.StartsWith(actual, StringComparison.Ordinal);
     }
 
     void GetNativePrompt(string owner)
@@ -1247,11 +1829,27 @@ public sealed partial class ContextManagerRuntime
         SendWindow("native-prompt", new { owner, prompt = character.Prompt ?? "", system = BuildOfficialSystemPrompt(character, FindStorageRoot()) });
     }
 
+    /// <summary>
+    /// 用 <c>ChatHistory</c> 里的**全文**替换 live-system 条目的预览正文。
+    ///
+    /// <para><b>⚠️ 这里以前是截图里那些怪现象的直接来源</b>：它用
+    /// <c>ExtractHistoryIndex(item.Title)</c> 从标题抠 <c>#N</c> 当 ChatHistory 的**下标**。
+    /// 而标题里的 N 早已改成「第几条 system 消息」（见 <see cref="LiveSystemTitle"/>），
+    /// 两者只在「所有 system 消息恰好连续排在开头」时才相等。
+    /// 角色设定之后一旦插入了消息（本插件自己注入的说明就是），就整体错位 —— 表现为：</para>
+    /// <list type="bullet">
+    /// <item>卡片**正文张冠李戴**：用错的 N 取到**别人**的正文；</item>
+    /// <item>同名模块**看起来重复**：两条 system 消息的 N 都落在同一段正文上，
+    /// 于是两张卡片显示一模一样的内容（用户报的 VirtualWorldService #4 / #5 就是这个）。</item>
+    /// </list>
+    ///
+    /// <para>改用 <see cref="LiveIndex"/>（读 <c>LiveOrder</c>，真实下标）后两者一致。</para>
+    /// </summary>
     void FillRuntimeSystemModuleContents(ChatActivity activity, string owner, List<ContextItem> items)
     {
         foreach (var item in items.Where(i => i.Owner == owner && i.SourceKey == "live-system"))
         {
-            var index = ExtractHistoryIndex(item.Title);
+            var index = LiveIndex(item);
             if (index >= 0 && index < activity.ChatBot.ChatHistory.Count)
                 item.Content = activity.ChatBot.ChatHistory[index].Content ?? "";
         }
@@ -1266,13 +1864,19 @@ public sealed partial class ContextManagerRuntime
                 ? values.EnumerateArray().Where(v => v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out _)).Select(v => v.GetInt32()).Distinct().OrderByDescending(i => i).ToList()
                 : new List<int>();
             if (requested.Count == 0) throw new InvalidOperationException("没有待删除的未参与装配对话");
-            var excluded = plan.Modules.Where(module => module.Source == "framework" && module.Group == "chat" && !module.Enabled)
-                .Select(module => module.TargetIndex).ToHashSet();
+            var activityForPrune = FindActivity(owner) ?? throw new InvalidOperationException("角色未激活，不能清理实时对话");
+            var historyForPrune = activityForPrune.ChatBot.ChatHistory;
+            // 判断「哪些下标允许删」时，按模块自己的**真实当前位置**判定（指纹优先），
+            // 而不是 plan 里那份可能已经漂移的 TargetIndex —— 否则历史一变就会放行删错消息。
+            var excluded = plan.Modules
+                .Where(module => module.Source == "framework" && module.Group == "chat" && !module.Enabled)
+                .Select(module => ResolveFrameworkIndex(module, historyForPrune))
+                .Where(index => index >= 0).ToHashSet();
             if (requested.Any(index => !excluded.Contains(index)))
                 throw new InvalidOperationException("只能删除已取消参与装配的对话消息");
             lock (stateLock)
             {
-                var activity = FindActivity(owner) ?? throw new InvalidOperationException("角色未激活，不能清理实时对话");
+                var activity = activityForPrune;
                 var removable = requested.Where(i => i > 0 && i < activity.ChatBot.ChatHistory.Count && activity.ChatBot.ChatHistory[i].Role != AuthorRole.System).ToList();
                 if (removable.Count == 0) throw new InvalidOperationException("没有可删除的 user/assistant 对话；系统消息不会被清理");
                 activity.ChatBot.EditChatHistory(thread =>
@@ -1281,9 +1885,17 @@ public sealed partial class ContextManagerRuntime
                 }, "ContextManager 批量清理未参与装配的对话");
 
                 var service = GetPlanService();
-                plan.Modules.RemoveAll(module => module.Source == "framework" && removable.Contains(module.TargetIndex));
-                foreach (var module in plan.Modules.Where(module => module.Source == "framework" && module.TargetIndex >= 0))
-                    module.TargetIndex -= removable.Count(index => index < module.TargetIndex);
+                // 删掉对应的 framework 模块（按指纹识别，不用可能已漂移的下标），
+                // 剩下的模块下标统一重算一遍 —— 重算同样走指纹，重算完就落盘，
+                // 这样 plan 里的 TargetIndex 永远是「当前历史的真实位置」。
+                plan.Modules.RemoveAll(module => module.Source == "framework"
+                    && ResolveFrameworkIndex(module, activity.ChatBot.ChatHistory) is var at
+                    && at >= 0 && removable.Contains(at));
+                foreach (var module in plan.Modules.Where(module => module.Source == "framework"))
+                {
+                    var at = ResolveFrameworkIndex(module, activity.ChatBot.ChatHistory);
+                    if (at >= 0) module.TargetIndex = at;
+                }
                 service.SavePlan(owner, plan);
                 SendPlan(owner, plan);
                 SendWindow("chat-pruned", new { owner, removed = removable.Count });
@@ -1381,11 +1993,40 @@ public sealed partial class ContextManagerRuntime
         return BuildOwnerItems(character, owner, storageRoot, activityMap, fullContent);
     }
 
-    static string LiveSystemTitle(string text, int index)
+    /// <summary>
+    /// 实时 system 消息的标题。<b>标题里只有名字，没有任何编号。</b>
+    ///
+    /// <para><b>⚠️⚠️ 这里是本项目最贵的一个坑，前后修了三批才彻底对。</b></para>
+    ///
+    /// <list type="number">
+    /// <item><b>第三批</b>：`index` 是**遍历整个 ChatHistory 的全局下标**，拼成 `"{名字} #{index}"`。
+    /// 名字从消息自身抠（对），但 `#N` 是**位置**，会随「有没有别的消息插进来」漂移 ——
+    /// 于是同一个 `#3` 一会儿是 A 模块、一会儿是 B 模块，用户看到「模块名和内容对不上」。</item>
+    /// <item><b>第五批</b>：把 `#N` 改成「**第几条 system 消息**」（`systemOrdinal`）。
+    /// 对**显示**而言这是对的（名字、序号都不再随位置漂），但它**悄悄弄坏了真正需要下标的地方**：
+    /// `FillRuntimeSystemModuleContents` / `ApplyLiveContentEdit` / `DeleteHistoryItem` /
+    /// `UpdateHistoryItem` / `ReadFullContent` 都还在用 `ExtractHistoryIndex(item.Title)`
+    /// 把标题里的 `#N` 当**数组下标**用 —— 于是卡片内容张冠李戴、同名模块重复显示，
+    /// 编辑和删除更会**改错、删错那条消息**。</item>
+    /// <item><b>本批（第六批）</b>：认清根本问题 —— **`#N` 这个字段同时被当成了「名字的一部分」
+    /// 和「数组下标」，两种语义不可能共用一个数字**。所以：</item>
+    /// </list>
+    ///
+    /// <para><b>现在的规则（不许再改回去）</b>：</para>
+    /// <list type="bullet">
+    /// <item><b>标题 = 纯名字</b>（`VirtualWorldService` 或 `角色设定`），不含任何 `#N`。</item>
+    /// <item><b>位置 = <see cref="ContextItem.LiveOrder"/></b>（整数），只用于排序与取下标，
+    /// 由 <see cref="LiveIndex"/> 读取，<b>绝不从标题里解析</b>。</item>
+    /// <item>界面上要显示位置时，前端用 `liveOrder` 自己拼「实际位置 #N」，与后端解耦。</item>
+    /// </list>
+    /// </summary>
+    static string LiveSystemTitle(string text, int systemOrdinal)
     {
-        if (index == 0) return "角色设定 #0";
-        var match = Regex.Match(text ?? "", @"^\[功能说明\(([^)]+)\)\]");
-        return match.Success ? $"{match.Groups[1].Value} #{index}" : $"系统模块 #{index}";
+        if (systemOrdinal == 0) return "角色设定";
+        var name = ContextPromptText.LiveSystemName(text);
+        // 名字抠不出来（用户自己加的 system 模块）→ 给一个**稳定**的兜底名。
+        // 不用序号：序号会随「用户增删别的 system 模块」而变，名字不该跟着变。
+        return name.Length > 0 ? name : "系统模块";
     }
 
     void AddLivePromptFallback(Character character, string owner, List<ContextItem> items)
@@ -1520,7 +2161,8 @@ public sealed partial class ContextManagerRuntime
         }
         if (item.SourceKey == "offline-history")
         {
-            var wanted = ExtractHistoryIndex(item.Title);
+            // offline 条目没有 LiveOrder（非实时），LiveIndex 会退回解析标题 —— 行为不变。
+            var wanted = LiveIndex(item);
             var index = 0;
             using var reader = new JsonTextReader(new StreamReader(item.Path));
             if (reader.Read() && reader.TokenType == JsonToken.StartArray)
@@ -1544,7 +2186,8 @@ public sealed partial class ContextManagerRuntime
             var activity = FindActivity(item.Owner);
             if (activity != null)
             {
-                var idx = ExtractHistoryIndex(item.Title);
+                // ⚠️「读取全文」是**不可逆**的（前端可能写回），下标必须准。用 LiveIndex。
+                var idx = LiveIndex(item);
                 if (idx >= 0 && idx < activity.ChatBot.ChatHistory.Count)
                     return activity.ChatBot.ChatHistory[idx].Content ?? "";
             }
@@ -1554,7 +2197,7 @@ public sealed partial class ContextManagerRuntime
             var activity = FindActivity(item.Owner);
             if (activity != null)
             {
-                var idx = MessageIndexFromTitle(item.Title);
+                var idx = LiveIndex(item);
                 if (idx >= 0 && idx < activity.ChatBot.ChatHistory.Count)
                     return activity.ChatBot.ChatHistory[idx].Content ?? "";
             }
@@ -1818,6 +2461,9 @@ public sealed partial class ContextManagerRuntime
                         "不含多模态Items"
                     },
                     Id = StableId(owner, "history", historyPath, index.ToString()),
+                    // 离线历史是从磁盘按顺序重建的，下标天然稳定；但仍然记一份指纹，
+                    // 好让「同一条对话」在角色激活后（live）与未激活时（offline）能被认出来是同一件事。
+                    AnchorKey = ContextPromptText.ComputeAnchorKey("live-history", role, text),
                     UpdatedAt = startTime ?? File.GetLastWriteTime(historyPath)
                 });
                 index++;
@@ -1942,18 +2588,22 @@ public sealed partial class ContextManagerRuntime
         if (item.SourceKey != "live-history" && item.SourceKey != "live-system") return;
         var activity = FindActivity(item.Owner);
         if (activity == null) return;
-        var idx = item.SourceKey == "live-system" ? 0 : MessageIndexFromTitle(item.Title);
+        // ⚠️ 以前这里硬编码了「live-system 一定是第 0 条」（`? 0 : …`）——
+        // 硬编码「live-system 一定是第 0 条」。这在**有多个 system 模块**时是错的
+        // （VirtualWorldService 这类会取到角色设定那条的附件）。统一走 LiveIndex。
+        var idx = LiveIndex(item);
         if (idx < 0 || idx >= activity.ChatBot.ChatHistory.Count) return;
         var message = activity.ChatBot.ChatHistory[idx];
         item.Attachments = ExtractAttachments(message, includeBinary: true);
         item.EstimatedTokens = EstimateTokens(message.Content ?? "") + item.Attachments.Sum(a => 120);
     }
 
-    int MessageIndexFromTitle(string title)
-    {
-        var match = Regex.Match(title ?? "", @"#(\d+)$");
-        return match.Success ? int.Parse(match.Groups[1].Value) : -1;
-    }
+    /// <summary>
+    /// ⚠️ <b>Deprecated：不要再用。</b>它与 <see cref="ExtractHistoryIndex"/> 是同一份正则的
+    /// 第二份拷贝 —— 两份实现迟早漂移，而且它们都已被 <see cref="LiveIndex"/> 取代。
+    /// 保留只为兼容老报文（<c>LiveOrder</c> 缺失时）。
+    /// </summary>
+    int MessageIndexFromTitle(string title) => ExtractHistoryIndex(title ?? "");
 
     /// <summary>世界书条目的单条报文预算（转义后字节）。与 state / plan 共用同一套口径。</summary>
     const int WorldBookBudgetBytes = ContextStateBudget.DefaultBudgetBytes;
@@ -2453,32 +3103,6 @@ public sealed partial class ContextManagerRuntime
 
     // ===== 上下文覆盖（酒馆兼容）=====
 
-    ContextOverrideBuilder GetOverrideBuilder()
-    {
-        if (overrideBuilder != null) return overrideBuilder;
-        overrideBuilder = new ContextOverrideBuilder(
-            owner =>
-            {
-                var character = GetCharacters().FirstOrDefault(c => c.Name == owner);
-                var dir = character == null ? null : ResolveCharacterDirectory(character, FindStorageRoot());
-                var path = dir == null ? null : Path.Combine(dir, "index.json");
-                return string.IsNullOrEmpty(path) || !File.Exists(path) ? null : JObject.Parse(File.ReadAllText(path));
-            },
-            presetName =>
-            {
-                var file = Path.Combine(GetPresetDirectory(), SafeFileName(presetName) + ".json");
-                return File.Exists(file) ? File.ReadAllText(file) : null;
-            },
-            owner =>
-            {
-                var character = GetCharacters().FirstOrDefault(c => c.Name == owner);
-                var dir = character == null ? null : ResolveCharacterDirectory(character, FindStorageRoot());
-                var path = dir == null ? null : Path.Combine(dir, "WorldBook.json");
-                return string.IsNullOrEmpty(path) || !File.Exists(path) ? null : JObject.Parse(File.ReadAllText(path));
-            });
-        return overrideBuilder;
-    }
-
     // 临时覆盖按“角色”保存：OverrideState/角色名/context.txt（不写系统角色 index.json）
     string GetOverrideDirectory(string owner)
     {
@@ -2512,12 +3136,6 @@ public sealed partial class ContextManagerRuntime
         catch (Exception ex) { ContextTrace.Write("read temp override failed: " + ex.Message); return null; }
     }
 
-    void WriteTempOverride(string owner, string content)
-    {
-        try { File.WriteAllText(GetOverrideFile(owner), content); }
-        catch (Exception ex) { ContextTrace.Write("write temp override failed: " + ex.Message); }
-    }
-
     void DeleteTempOverride(string owner)
     {
         try
@@ -2526,116 +3144,6 @@ public sealed partial class ContextManagerRuntime
             if (File.Exists(file)) File.Delete(file);
         }
         catch (Exception ex) { ContextTrace.Write("delete temp override failed: " + ex.Message); }
-    }
-
-    void ApplyOverride(string owner, JsonElement payload)
-    {
-        _ = Task.Run(() =>
-        {
-            lock (stateLock)
-            {
-                try
-                {
-                    var character = GetCharacterRequired(owner);
-
-                    // 以前端传来的选项为准，同步到配置
-                    var pmode = JsonString(payload, "mode");
-                    if (!string.IsNullOrWhiteSpace(pmode)) Config.OverrideMode = pmode;
-                    var ppreset = JsonString(payload, "activePreset");
-                    if (ppreset != null) Config.ActivePreset = ppreset;
-                    if (payload.TryGetProperty("useCharacterCard", out var uc) && (uc.ValueKind == JsonValueKind.True || uc.ValueKind == JsonValueKind.False)) Config.UseCharacterCard = uc.GetBoolean();
-                    if (payload.TryGetProperty("useWorldBook", out var uw) && (uw.ValueKind == JsonValueKind.True || uw.ValueKind == JsonValueKind.False)) Config.UseWorldBook = uw.GetBoolean();
-                    if (payload.TryGetProperty("applyMacros", out var um) && (um.ValueKind == JsonValueKind.True || um.ValueKind == JsonValueKind.False)) Config.ApplyMacros = um.GetBoolean();
-
-                    var mode = (Config.OverrideMode ?? "Off");
-                    var rendered = GetOverrideBuilder().Build(owner, Config);
-
-                    if (mode == "Permanent")
-                    {
-                        // 完全覆盖：写入 index.json 的 Prompt（永久）。删除临时文件。
-                        UpdateIndexJson(owner, jo => jo["Prompt"] = rendered);
-                        DeleteTempOverride(owner);
-                    }
-                    else if (mode == "Temporary")
-                    {
-                        // 临时覆盖：不改 index.json，把渲染内容存插件目录并注入运行态
-                        WriteTempOverride(owner, rendered);
-                        var activity = chatActivitySystem.GetChatActivity(character);
-                        if (activity != null)
-                        {
-                            activity.ChatBot.EditChatHistory(thread =>
-                            {
-                                if (thread.ChatHistory.Count > 0)
-                                    thread.ChatHistory[0].Content = rendered;
-                            }, "ContextManager 临时覆盖注入");
-                        }
-                    }
-                    else
-                    {
-                        throw new InvalidOperationException("当前覆盖模式为关闭");
-                    }
-
-                    SendOverrideState(owner);
-                    QueueInitialState();
-                }
-                catch (Exception ex) { SendWindow("error", new { message = "应用覆盖失败：" + ex.Message }); }
-            }
-        });
-    }
-
-    void ClearOverride(string owner)
-    {
-        _ = Task.Run(() =>
-        {
-            lock (stateLock)
-            {
-                try
-                {
-                    var character = GetCharacterRequired(owner);
-                    DeleteTempOverride(owner);
-
-                    // 若 index.json 的 Prompt 含有注入块（完全覆盖后想还原），剥离后还原为原始角色设定
-                    var dir = ResolveCharacterDirectory(character, FindStorageRoot()) ?? throw new InvalidOperationException("角色目录不存在");
-                    var indexPath = Path.Combine(dir, "index.json");
-                    var jo = JObject.Parse(File.ReadAllText(indexPath));
-                    var prompt = jo.Value<string>("Prompt") ?? "";
-                    if (prompt.Contains(ContextOverrideBuilder.BlockOpenPrefix))
-                        jo["Prompt"] = ContextOverrideBuilder.StripOverrideBlocks(prompt);
-                    File.WriteAllText(indexPath, jo.ToString(Formatting.Indented));
-
-                    // 运行态用 index.json 重建 index[0]
-                    var activity = chatActivitySystem.GetChatActivity(character);
-                    if (activity != null)
-                    {
-                        var fresh = JObject.Parse(File.ReadAllText(indexPath));
-                        var rebuilt = BuildOfficialSystemPrompt(fresh.ToObject<Character>() ?? character, FindStorageRoot());
-                        activity.ChatBot.EditChatHistory(thread =>
-                        {
-                            if (thread.ChatHistory.Count > 0)
-                                thread.ChatHistory[0].Content = rebuilt;
-                        }, "ContextManager 还原系统提示词");
-                    }
-
-                    SendOverrideState(owner);
-                    QueueInitialState();
-                }
-                catch (Exception ex) { SendWindow("error", new { message = "清除覆盖失败：" + ex.Message }); }
-            }
-        });
-    }
-
-    void SendOverrideState(string owner)
-    {
-        SendWindow("override-state", new
-        {
-            owner,
-            mode = Config.OverrideMode ?? "Off",
-            activePreset = Config.ActivePreset ?? "",
-            useCharacterCard = Config.UseCharacterCard,
-            useWorldBook = Config.UseWorldBook,
-            applyMacros = Config.ApplyMacros,
-            hasTemp = ReadTempOverride(owner) != null
-        });
     }
 
     // 框架注入的官方系统消息（index[0]）。装配页的「角色设定 #0」模块保存的就是这段全文，
@@ -2722,24 +3230,27 @@ public sealed partial class ContextManagerRuntime
     /// </summary>
     CharacterPresetSources? CapturePresetSources(string owner, CharacterPresetSources? previous = null)
     {
-        var activePreset = (Config.ActivePreset ?? "").Trim();
         string? dir = null;
         try { dir = ResolveCharacterDirectory(GetCharacterRequired(owner), FindStorageRoot()); }
         catch (Exception ex) { ContextTrace.Write($"preset sources(character) failed owner={owner}: {ex.Message}"); }
 
         var worldBookPath = string.IsNullOrWhiteSpace(dir) ? null : Path.Combine(dir, "WorldBook.json");
         var cardPath = string.IsNullOrWhiteSpace(dir) ? null : Path.Combine(dir, "TavernCard.json");
-        string? presetPath = null;
-        if (activePreset.Length > 0)
+        // 酒馆预设：快照带上**目录里存在的全部预设文件**。
+        // （以前只带 Config.ActivePreset 那一个；那个字段已随死路径删除，
+        //   而且「只带当前选中的一份」本身也不对 —— 换角色导入时对方可能根本没有那个名字。）
+        var presetPaths = new List<string>();
+        try
         {
-            try { presetPath = Path.Combine(GetPresetDirectory(), SafeFileName(activePreset) + ".json"); }
-            catch (Exception ex) { ContextTrace.Write($"preset sources(preset) failed owner={owner}: {ex.Message}"); }
+            var presetDir = GetPresetDirectory();
+            if (Directory.Exists(presetDir))
+                presetPaths.AddRange(Directory.GetFiles(presetDir, "*.json").OrderBy(f => f, StringComparer.Ordinal));
         }
+        catch (Exception ex) { ContextTrace.Write($"preset sources(presets) failed owner={owner}: {ex.Message}"); }
 
         var fingerprints = new List<string>();
-        foreach (var path in new[] { worldBookPath, cardPath, presetPath })
+        foreach (var path in new[] { worldBookPath, cardPath }.Concat(presetPaths))
             if (!string.IsNullOrWhiteSpace(path)) fingerprints.Add(Fingerprint(path!));
-        fingerprints.Add("preset|" + activePreset);
         fingerprints.Sort(StringComparer.Ordinal);
 
         if (previous != null && previous.Fingerprints.Count == fingerprints.Count
@@ -2749,12 +3260,12 @@ public sealed partial class ContextManagerRuntime
         var sources = new CharacterPresetSources
         {
             CapturedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-            ActivePreset = activePreset,
             Fingerprints = fingerprints
         };
         if (worldBookPath != null) sources.WorldBook = ReadJsonObjectOrNull(worldBookPath);
         if (cardPath != null) sources.TavernCard = ReadJsonObjectOrNull(cardPath);
-        if (presetPath != null) sources.Preset = ReadJsonObjectOrNull(presetPath);
+        // 单份预设仍走 Preset 字段（保持与旧快照格式兼容），多余的在 RestorePresetSources 按文件写回。
+        if (presetPaths.Count > 0) sources.Preset = ReadJsonObjectOrNull(presetPaths[0]);
         return sources.IsEmpty ? null : sources;
     }
 
@@ -2780,15 +3291,18 @@ public sealed partial class ContextManagerRuntime
             }
         }
         catch (Exception ex) { ContextTrace.Write($"preset sources restore failed owner={owner}: {ex.Message}"); return null; }
-        // 酒馆预设：只在当前没有选中任何预设时才替用户选上 —— 用户手选的预设不该被快照改掉。
+        // 酒馆预设：只在**目标目录里还没有同名预设文件**时才写回 —— 用户本机已有的预设不该被快照覆盖。
         try
         {
-            if (!string.IsNullOrWhiteSpace(sources.ActivePreset) && string.IsNullOrWhiteSpace(Config.ActivePreset) && sources.Preset != null)
+            if (!string.IsNullOrWhiteSpace(sources.ActivePreset) && sources.Preset != null)
             {
-                AtomicWrite(Path.Combine(GetPresetDirectory(), SafeFileName(sources.ActivePreset) + ".json"), sources.Preset.ToString(Formatting.Indented));
-                Config.ActivePreset = sources.ActivePreset;
-                notes.Add($"酒馆预设「{sources.ActivePreset}」");
-                ListPresets();
+                var target = Path.Combine(GetPresetDirectory(), SafeFileName(sources.ActivePreset) + ".json");
+                if (!File.Exists(target))
+                {
+                    AtomicWrite(target, sources.Preset.ToString(Formatting.Indented));
+                    notes.Add($"酒馆预设「{sources.ActivePreset}」");
+                    ListPresets();
+                }
             }
         }
         catch (Exception ex) { ContextTrace.Write($"preset sources restore preset failed owner={owner}: {ex.Message}"); }
@@ -3239,7 +3753,7 @@ public sealed partial class ContextManagerRuntime
         return string.IsNullOrWhiteSpace(safe) ? "Preset" : safe;
     }
 
-    List<Character> GetCharacters()
+    internal List<Character> GetCharacters()
     {
         var result = new List<Character>();
         try

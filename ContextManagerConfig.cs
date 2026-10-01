@@ -1,3 +1,5 @@
+using System.ComponentModel;
+
 namespace Marisa.ContextManager;
 
 /// <summary>
@@ -5,42 +7,63 @@ namespace Marisa.ContextManager;
 ///
 /// ⚠️ 这里**只保留真的有人读的字段**。
 ///
-/// 2026-09-30 清理：历史上这个类还挂着
-/// <c>IncludeMemoryHistory</c> / <c>IncludeNotes</c> / <c>IncludeSkills</c> /
-/// <c>IncludeGroupChat</c> / <c>MaxHistoryItems</c> / <c>MaxPreviewChars</c> 六个字段，
-/// 但全项目（含前端）**没有任何一行代码读它们** —— 面板上却显示得像真开关，
-/// 用户改完发现没反应。其中 <c>MaxPreviewChars</c> 造成的误解最深：旧代码曾
-/// 「临时把它改成 220 再取摘要」，看起来像在做短预览，实际上取内容的一直是
-/// <c>Limit()</c>（无条件返回全文），state 报文一直在推全文 ——
-/// 这正是 2026-09-29「激活第二个角色把 IPC 桥顶断」的成因之一。
-/// 删掉这些字段，面板上剩下的每一个都是真的生效的。
+/// 2026-10-01 清理（第二轮）：删掉 <c>OverrideMode</c> / <c>ActivePreset</c> /
+/// <c>UseCharacterCard</c> / <c>UseWorldBook</c> / <c>ApplyMacros</c> 五个字段。
+/// 它们全是 <see cref="ContextOverrideBuilder"/> 那条**已死路径**的输入 ——
+/// 那条路径唯一的入口 <c>ApplyOverride</c> 在 IPC 分派表里**根本没有登记**，
+/// 前端也从不发送对应消息（前端只发 <c>agent-answer</c> 与 <c>card-worldbook-answer</c>）。
+/// 换句话说：这五个开关改了什么都不会发生。
+///
+/// 它们比看上去更糟：<c>UseCharacterCard</c> / <c>UseWorldBook</c> 想表达的是
+/// 「要不要把角色卡/世界书并进系统消息」，可模块化装配里**这本来就是两个模块**，
+/// 勾不勾由模块自己的 <c>Enabled</c> 决定 —— 留着反而多出一套互相打架的抽象
+/// （同一件事两处开关，用户不知道哪个说了算）。
+///
+/// 2026-09-30 清理（第一轮）：删掉 <c>IncludeMemoryHistory</c> / <c>IncludeNotes</c> /
+/// <c>IncludeSkills</c> / <c>IncludeGroupChat</c> / <c>MaxHistoryItems</c> /
+/// <c>MaxPreviewChars</c> 六个字段，同样是全项目无人读。
+///
+/// 结论：面板上剩下的每一个都是真的生效的。
 /// </summary>
 public class ContextManagerConfig
 {
-    /// <summary>
-    /// 上下文覆盖方式。
-    /// <c>Off</c> = 关闭（走 Alife 原生装配）；
-    /// <c>Temporary</c> = 插件覆盖（只在每次请求前重排上下文，不动角色文件）；
-    /// <c>Permanent</c> = 本地覆盖（把装配结果写进角色 index.json，插件关掉也生效）。
-    /// 与插件窗口里「上下文装配」页的「覆盖方式」是同一个值，两边会同步。
-    /// </summary>
-    public string OverrideMode { get; set; } = "Off";
-
-    /// <summary>当前选中的酒馆预设名（对应 <c>Storage/ContextManager/Presets/&lt;名&gt;.json</c>）。</summary>
-    public string ActivePreset { get; set; } = "";
-
-    /// <summary>
-    /// 是否把角色卡字段（描述 / 性格 / 场景 / 对话示例 / 系统指令 / 历史后指令）
-    /// 并入 <c>index[0]</c> 层。见 <see cref="ContextOverrideBuilder"/>。
-    /// </summary>
-    public bool UseCharacterCard { get; set; } = true;
-
-    /// <summary>是否把世界书常驻段（before 位置）并入 <c>index[0]</c> 层。</summary>
-    public bool UseWorldBook { get; set; } = true;
+    // ── 角色侧接口（2026-10-01 新增）──────────────────────────────────────
+    //
+    // 这两个开关决定「角色能不能自己改上下文」。默认**都关**。
+    //
+    // 为什么默认关：上下文直接决定角色「是什么」—— 让角色能随手改发给模型的提示词，
+    // 等于把人格的写权限交给她自己。这不是能力问题，是信任级别问题，必须由用户显式打开。
+    //
+    // ⚠️ 2026-10-01（第二轮）：**逐次审批已取消**。
+    // 原先的设计是「开关管够不够得着 + 每次改动还要用户点批准」两道闸。
+    // 用户指出这是多余的：「既然都有可以修改的开关了，那就是信任的表达，
+    // 已经做过一次决定的事不该每次重问」。所以现在：
+    //
+    //   · 开关 = **唯一的**授权表达（默认关 = 完全够不着，角色连这个能力都不知道）；
+    //   · 开着 = 角色可以自主增删改，**不再逐次弹窗**；
+    //   · 仅剩两处例外仍然会问用户（见 ContextAgentGuard）：
+    //       ① 要把插件装到**别的角色**身上（动别人 index.json 的 Modules）；
+    //       ② 要用**本地覆盖**（动别人/自己 index.json 的 Prompt，不可逆）。
+    //     这两件事都「越过了角色边界」或「不可逆」，与「信任这个 AI」不是同一回事。
 
     /// <summary>
-    /// 渲染时是否执行 Handlebars 宏替换。关掉就按原文发送
-    /// （此时 <c>{{char}}</c> 之类不会被替换）。与装配页控制栏的「启用 Handlebars 宏」是同一个值。
+    /// 允许角色查看并修改**自己**的上下文（模块增删改、自己的快照、应用到自身）。
+    /// 关闭时相关函数连调用都会被拒绝，角色也不知道有这个能力。
+    /// 打开后角色可自主操作，**不再逐次要求用户批准**。
     /// </summary>
-    public bool ApplyMacros { get; set; } = true;
+    [DisplayName("允许角色修改自己的上下文")]
+    [Description("打开后，角色可以通过工具查看、增删改自己的上下文模块，保存/删除/切换自己的快照，并把改动应用到自身。"
+        + "打开即视为你信任她，操作不会再弹窗询问；默认关闭时角色连这个能力都不知道有。")]
+    public bool AllowModifySelf { get; set; }
+
+    /// <summary>
+    /// 允许角色查看并修改**其他角色**的上下文。
+    /// 这是更强的权限：一个角色能改别人的提示词，等于能影响别人的言行。
+    /// 开启后仍是自主操作（不逐次批准），但「给别的角色安装插件」与「改用本地覆盖」
+    /// 这两件事仍会问用户 —— 前者动别人的角色文件，后者不可逆。
+    /// </summary>
+    [DisplayName("允许角色修改其他角色的上下文")]
+    [Description("打开后，角色可以查看、增删改其他角色的上下文模块与快照。这是更强的权限（等于能影响别人的言行）。"
+        + "默认关闭；打开后操作不逐次弹窗，但「给别的角色安装插件」与「改用本地覆盖」仍会征求你同意。")]
+    public bool AllowModifyOthers { get; set; }
 }

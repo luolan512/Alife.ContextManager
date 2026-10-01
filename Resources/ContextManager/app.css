@@ -165,6 +165,11 @@ body[data-view="chat"] .studio { grid-template-columns:252px minmax(620px,1fr); 
 .identity-badge.system { color:#b45309; background:#fef3c7; }
 .identity-badge.user { color:#1d4ed8; background:#dbeafe; }
 .identity-badge.assistant { color:#047857; background:#d1fae5; }
+/* 「同名 N 条」角标：同名模块出现的提示。用户报过「一个模块出现两次」，
+   这里明确标出来 —— 免得看起来像界面渲染错了。 */
+.dup-badge { display:inline-block; padding:2px 7px; border-radius:7px; font-size:11px; font-weight:800;
+  line-height:1.3; color:#9a3412; background:#ffedd5; border:1px solid #fdba74; }
+.dup-badge::before { content:"⚠ "; }
 .inspector-content { width:100%; min-height:300px; resize:vertical; padding:10px; border:1px solid var(--line-strong); border-radius:8px; font:inherit; line-height:1.6; }
 .plan-editor .assembly-lane { display:block; margin-top:18px; }
 .plan-editor .module-stack { margin-bottom:10px; }
@@ -306,6 +311,13 @@ body[data-view="assembly"] .page-head { padding-bottom: 10px; }
 .ask-hint { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; background: #fbfaf8; font-size: 11.5px; }
 .ask-remember { display: flex; align-items: center; gap: 6px; margin-top: 12px; color: var(--ink-soft); font-size: 12px; cursor: pointer; }
 .ask-remember input { margin: 0; }
+/* 角色改动申请里的「改了什么」：多行正文要保排版，长内容要能滚。
+   max-height 是必需的 —— 一个模块正文可能上万字，不能让它把弹窗按钮顶出屏幕。 */
+.ask-detail {
+  margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px;
+  background: #fbfaf8; font-size: 12px; line-height: 1.65; white-space: pre-wrap;
+  word-break: break-word; max-height: 320px; overflow: auto;
+}
 
 /* ── 编辑大窗口的「放大内容」 ─────────────────────────────────────────────
    内容区块旁有一个「⤢ 放大」按钮：点一下把内容编辑器顶到整个弹窗，
@@ -348,3 +360,39 @@ body[data-view="assembly"] .page-head { padding-bottom: 10px; }
   0%, 100% { box-shadow: 0 0 0 0 rgba(112,87,232,0); }
   18% { box-shadow: 0 0 0 5px rgba(112,87,232,.28); }
 }
+
+/* ── 「怎么用这个插件」说明页 ─────────────────────────────────────────────
+   说明不该只躺在 README 里：用户在窗口里操作，遇到「这个开关到底会改什么」
+   的时候应该就地能看到答案。样式刻意用正常正文排版（不是代码块），
+   因为这是给人读的段落，不是给机器读的数据。 */
+.guide { display: grid; gap: 6px; max-width: 74ch; }
+.guide h4 { margin: 12px 0 2px; color: #3d3552; font-size: 13px; font-weight: 800; }
+.guide h4:first-child { margin-top: 4px; }
+.guide p, .guide li { margin: 0; color: #55575f; font-size: 12.5px; line-height: 1.72; }
+.guide ul { display: grid; gap: 4px; margin: 2px 0 0; padding-left: 20px; }
+.guide b { color: #322c46; }
+.guide code { padding: 1px 5px; border-radius: 4px; color: #4b3ba8; background: #f1edff; font: 11.5px ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.guide-lead { margin-top: 6px !important; color: #44424e !important; }
+.guide-warn {
+  margin-top: 8px !important; padding: 8px 11px; border-left: 3px solid #e5b64a;
+  border-radius: 0 7px 7px 0; background: #fdf8ec;
+}
+
+/* ── 「AI 改过上下文」提示条（见 app.js showExternalPlanNotice） ────────────────
+   贴在 workspace 顶部：可见但不抢焦点（外部改动可能连着来几条）。
+   浅色主题：浅底 + 深字，与页面其余部分一致。 */
+.external-plan-notice {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 10px; padding: 9px 13px;
+  border: 1px solid #cfe0f0; border-radius: 10px;
+  color: #2c4a6b; background: #f2f8fd;
+  font-size: 12px; line-height: 1.6;
+}
+.external-plan-notice .epn-text { flex: 1 1 auto; min-width: 180px; }
+.external-plan-notice .epn-text b { color: #17395e; }
+.external-plan-notice button { flex: 0 0 auto; }
+.external-plan-notice .epn-dismiss {
+  flex: 0 0 auto; cursor: pointer; color: #5a7391;
+  font-size: 12px; text-decoration: underline; text-underline-offset: 2px;
+}
+.external-plan-notice .epn-dismiss:hover { color: #2c4a6b; }

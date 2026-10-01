@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Context Studio · Alife</title>
-  <link rel="stylesheet" href="./app.css?v=20260930p" />
+  <link rel="stylesheet" href="./app.css?v=20261002ah" />
 </head>
 <body>
   <div class="titlebar">
@@ -24,6 +24,7 @@
       </div>
       <nav id="navList" class="sidebar-nav" aria-label="工作区"></nav>
       <div class="sidebar-bottom">
+        <button id="navHelp" class="btn wide quiet" title="一页说清这个插件管什么、三种覆盖方式的区别、装配页怎么操作">? 怎么用这个插件</button>
         <button id="newCharacterBtn" class="btn wide">新建角色</button>
         <button id="importTavernBtn" class="btn primary wide">导入酒馆资源</button>
       </div>
@@ -40,6 +41,7 @@
   <!-- 不要用 document.write 注入本脚本：实测 Chromium/Electron 下 document.write 写入的
        外链 script 可能完全不加载，页面会没有任何脚本、所有按钮失效。
        这里保持静态 script 标签，并在每次改动 app.js 时递增 v 以绕过缓存。 -->
-  <script src="./app.js?v=20260930p"></script>
+  <script src="./app.js?v=20261002ah"></script>
 </body>
 </html>
+

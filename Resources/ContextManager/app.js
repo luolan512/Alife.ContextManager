@@ -8,7 +8,7 @@ const initials = name => String(name || "?").trim().slice(0, 1).toUpperCase();
 const moduleId = () => window.require("crypto").randomUUID();
 const ipcChannel = new URLSearchParams(window.location.search).get("channel") || "marisa-context-manager";
 // 每次改动前端都要递增：日志里出现它就说明窗口加载的是这份 app.js。
-const APP_BUILD = "cm-app-2026-09-30-p";
+const APP_BUILD = "cm-app-2026-10-02-ah";
 
 // ---- 渲染端诊断日志：证明窗口实际加载了哪份 app.js、用的哪个 IPC 通道 ----
 const traceDir = (() => {
@@ -83,6 +83,9 @@ let bundleLoading = false;
 let planOwner = "", planLoading = false, planTimer = null, bundleRequest = 0, planError = "", planDirty = false;
 let planNotice = null;
 let planState = null; // ContextPlan: { mode, applyMacros, modules:[{id,name,role,content,enabled}] }
+// AI 改完计划、而用户这里正有未保存改动时，新计划先搁在这里，等用户点「载入最新」再换上。
+// 见 plan-updated 分支与 showExternalPlanNotice：**绝不**用它覆盖用户手上的草稿。
+let externalPendingPlan = null;   // { owner, plan } | null
 // 「角色预设」：每个角色在插件里保留的上下文记录快照。
 let characterPresets = {};   // { [owner]: [ {name, auto, updatedAt, mode, modules} ] }
 const nativePrompts = {};
@@ -408,7 +411,17 @@ function macroNoticeText(msg) {
 }
 
 // 装配页来源分层：酒馆预设 / 角色卡 / 世界书 / 角色设定 / 自定义 各自成块，避免混在同一层。
-const planSources = [["native","角色设定"],["preset","酒馆预设"],["card","角色卡"],["worldbook","世界书"],["custom","自定义"]];
+//
+// ⚠️⚠️ `agent` **必须在表里**，这是本项目踩过的一个坑（用户报「AI 新增的模块根本不显示，
+// 但预览里确实看得见」）：
+//   角色通过 `agentcontextadd` 新增的模块，后端写的 `Source` 是 `"agent"`
+//   （见 ContextAgentOps.AddModule）。而这里两个渲染函数都拿 `planSources` 当**来源白名单**：
+//       `const sources = assemblyFilter.source === 'all' ? planSources : …`
+//   于是 `agent` 不在表里 ⇒ 这条模块**任何布局下都不会画出来** ⇒ 界面看着像「AI 没加成功」。
+//   而「预览」是后端 `ContextCompiler.Compile` 直接渲染的，**不走这份白名单**，
+//   所以预览里能看到 —— 这个「看得见 / 看不见」的差，就是白名单缺项的唯一症状。
+//   把 `agent` 补进来即可；顺带把标签写清楚，用户才知道这是 AI 加的。
+const planSources = [["native","角色设定"],["agent","AI 新增"],["preset","酒馆预设"],["card","角色卡"],["worldbook","世界书"],["custom","自定义"]];
 const planSourceLabels = Object.fromEntries(planSources);
 const ASSEMBLY_FILTER_KEY = "marisa-context-assembly-filter";
 let assemblyFilter = (() => {
@@ -569,6 +582,57 @@ function renderNav() {
     return `<button class="nav-item ${currentView === id ? "active" : ""}" data-view="${id}" title="${esc(desc)}"><span class="nav-ic">${icon}</span><span><b>${label}</b><small>${esc(desc)}</small></span>${count !== "" ? `<em>${count}</em>` : ""}</button>`;
   }).join("");
   $$(".nav-item").forEach(btn => btn.onclick = () => { currentView = btn.dataset.view; selectedAssemblyModule = ""; render(); });
+  // 「怎么用」常驻在导航栏底部 —— 说明不该藏在 README 里：用户是在窗口里操作，
+  // 遇到「这个开关到底会改什么」的时候应该就地能看到答案。
+  const help = $("#navHelp");
+  if (help) help.onclick = openGuide;
+}
+
+// 一页说清「这个插件怎么管上下文」。刻意分四块、每块几句话：
+// 1) 它管的是什么  2) 三种覆盖方式（最容易踩坑的地方）  3) 装配页怎么操作  4) 快照怎么用
+function openGuide() {
+  const body = `
+    <div class="guide">
+      <p class="guide-lead">这个插件管的是<b>「这一次请求到底发了什么给模型」</b>。左侧每一页都是这堆内容的一个切面；右栏是编辑区；改动先落在草稿里，点保存才生效。</p>
+
+      <h4>一、它管的是哪些东西</h4>
+      <ul>
+        <li><b>角色预设</b> —— 角色卡里的描述 / 性格 / 场景 / 开场白 / 作者注释，可单独抽出成模块。</li>
+        <li><b>系统提示词</b> —— 框架注入的系统消息，以及各个插件注册的「功能说明」。</li>
+        <li><b>长期记忆</b> —— MemoryService 的 L1/L2/L3 摘要与 History 原始流水。</li>
+        <li><b>对话历史</b> —— 当前实时对话窗口里的每一条消息。</li>
+        <li><b>世界书 / 便签 / 技能 / 多模态</b> —— 各自的页签里单独管。</li>
+      </ul>
+
+      <h4>二、三种覆盖方式（先搞清这个）</h4>
+      <p>装配页顶部那个下拉就是它，决定了你的改动<b>影响到哪一层</b>：</p>
+      <ul>
+        <li><b>关闭</b> —— 什么都不做，请求完全按框架原本的样子发出去。</li>
+        <li><b>插件覆盖</b>（推荐，随时可退） —— 改动只存在本插件自己的计划文件里。框架完全不知情，关掉开关就恢复原样。<b>角色自己改上下文走的就是这条路。</b></li>
+        <li><b>本地覆盖</b> —— 改动会写回角色自己的文件（index.json / History.json），<b>框架原生也会看到</b>。关掉插件也不会还原，只有点「还原原始设定」才能退回。<b>改角色本体的事情只走这条路，而且必须先问过你。</b></li>
+      </ul>
+      <p class="guide-warn">一句话区分：<b>插件覆盖是「这次请求换成我改的」，本地覆盖是「把角色文件本身改掉」。</b>不确定就选插件覆盖。</p>
+
+      <h4>三、装配页怎么操作</h4>
+      <ul>
+        <li><b>参与装配</b> —— 每个模块右上角的勾。取消勾选 = 这一条不发给模型（内容还在，随时可勾回来）。</li>
+        <li><b>排序</b> —— 模块在分组内的先后顺序，就决定了它在最终请求里的位置。</li>
+        <li><b>编辑</b> —— 点模块 → 右栏改正文与身份（system / user / assistant）→ 保存草稿。</li>
+        <li><b>生成预览</b> —— 底部按钮。它会把当前这套装配<b>真正拼一遍</b>给你看，是发布前的最后一道检查。</li>
+        <li><b>应用到当前角色</b> —— 把草稿真正生效。插件覆盖模式下其实保存即生效，这个按钮主要给本地覆盖用。</li>
+      </ul>
+
+      <h4>四、快照与角色记录</h4>
+      <ul>
+        <li><b>快照</b> —— 把「当前这套装配」整体存一份，之后可以随时切回来。适合「日常用 A 方案，写作用 B 方案」。</li>
+        <li><b>角色记录 / 角色预设</b> —— 跨角色搬运一整套装配方案，或导出给别人。</li>
+      </ul>
+
+      <p class="guide-lead">还有问题？每个开关和按钮上都有悬停提示，写着它具体会改什么。完整的原理说明在插件目录下的 <code>README.md</code>。</p>
+    </div>` + `<div class="toolbar modal-actions"><button class="btn primary" id="guideClose">知道了</button></div>`;
+  openModal("怎么用这个插件", body);
+  const close = () => closeModal();
+  const btn = $("#guideClose"); if (btn) btn.onclick = close;
 }
 
 function countMedia() {
@@ -984,10 +1048,68 @@ function wirePaging() {
     setStatus("正在读取全文…");
   });
 }
-function messageIndex(i) {
-  const m = /#(\d+)/.exec(i.title || ""); return m ? Number(m[1]) : (i.sourceKey === "character-prompt" ? -2 : -1);
+// 这条实时消息在历史里的次序（= 真实数组下标）。**全站唯一的「位置」来源。**
+//
+// ⚠️ 后端从第六批起**不再把位置写进标题**（标题里只有名字，见 LiveSystemTitle）——
+// 因为那个 `#N` 曾被同时当成「名字的一部分」和「数组下标」，两种语义共用一个数字，
+// 必然互相污染：名字随位置漂、下标随名字错（编辑器会改到别人那一条上）。
+// 现在位置只有一个来源：后端直接给的整数 `liveOrder`。
+// 保留解析标题的分支**只是给老报文兜底**，新报文永远走 `liveOrder`。
+function liveOrdinal(i){
+  if(typeof i.liveOrder === "number" && i.liveOrder >= 0) return i.liveOrder;
+  // 老报文（没有 liveOrder）：标题里那个 #N 那时确实是数组下标。
+  const m = /#(\d+)/.exec(i.title || "");
+  return m ? Number(m[1]) : (i.sourceKey === "character-prompt" ? -2 : -1);
 }
-
+// 兼容别名：以前叫 messageIndex，用法完全一致。**不要各写一份实现** ——
+// 两份拷贝迟早漂移，本项目已经因此错过一次（ExtractHistoryIndex / MessageIndexFromTitle）。
+function messageIndex(i){ return liveOrdinal(i); }
+// ── 运行时（framework）模块的配对 ────────────────────────────────────────────
+// 以前这里只有一个键：targetIndex（= 标题里的 #N = 消息在 ChatHistory 里的下标）。
+// 下标不是身份 —— 对话历史一更新（前部被裁剪、中间插入新消息），同一条消息的下标就变了，
+// 而计划里记的还是旧下标，于是卡片上的<b>名字</b>（读当前消息的 title）与<b>正文</b>
+// （读计划里那条模块的 content）来自两条不同的消息，看起来就是「模块名和内容对不上」。
+//
+// Use the same one-to-one matching policy as the backend. Never write keys from stale indices.
+function anchorOf(i) { return i.anchorKey || ""; }
+function findFrameworkModule(item) {
+  const mods = (planState?.modules || []).filter(m => m.source === 'framework');
+  const live = (snapshot?.items || []).filter(i => i.owner === selectedOwner && anchorOf(i))
+    .sort((a,b) => messageIndex(a)-messageIndex(b));
+  const used = new Set(), resolved = new Map();
+  const legacy = m => !m.anchorKey || (anchorName(m.anchorKey) && !m.anchorKey.includes('#hash:'));
+  for (const m of mods.filter(m => !legacy(m))) {
+    const hit = live.find(i => !used.has(i.id) && anchorOf(i) === m.anchorKey);
+    if (hit) { used.add(hit.id); resolved.set(hit.id, m); }
+  }
+  for (const m of mods.filter(legacy)) {
+    const originalName = /^\[功能说明\(([^)]+)\)\]/.exec(m.originalContent || '')?.[1] || '';
+    const display = frameworkDisplayName({title:m.name});
+    const name = anchorName(m.anchorKey) || originalName
+      || ((m.originalRole || 'system') === 'system' && /^[A-Za-z_][A-Za-z0-9_.]*$/.test(display) ? display : '');
+    const candidates = live.filter(i => !used.has(i.id) && i.kind === (m.originalRole || 'system')
+      && (!name || anchorName(anchorOf(i)) === name));
+    const exact = candidates.filter(i => m.originalContent && !i.truncated && i.content === m.originalContent);
+    const hit = exact.length ? (exact.find(i => messageIndex(i) === m.targetIndex) || exact[0])
+      : (name && candidates.length === 1 ? candidates[0] : null);
+    if (hit) { used.add(hit.id); resolved.set(hit.id, m); }
+  }
+  const matched = resolved.get(item.id) || null;
+  // Old saved drafts can carry a neighbour's override body despite a correct anchor.
+  if (matched && !matched.truncated) {
+    const expected=anchorName(anchorOf(item));
+    const bodyName=/^\[功能说明\(([^)]+)\)\]/.exec(matched.content || '')?.[1] || '';
+    const originalName=/^\[功能说明\(([^)]+)\)\]/.exec(matched.originalContent || '')?.[1] || '';
+    if (expected && bodyName && bodyName !== expected && originalName === expected) {
+      matched.content=matched.originalContent;
+      planDirty=true;
+    }
+  }
+  return matched;
+}
+function anchorName(key) {
+  return /^live-system\|system\|name:(.*?)(?:#hash:|~\d+$|$)/.exec(key || '')?.[1] || '';
+}
 let memorySearchQuery = "";
 function renderMemory() {
   if (renderInactiveContextPage("长期记忆")) return;
@@ -1271,7 +1393,7 @@ function renderAssembly() {
   $$("[data-framework-edit]").forEach(button=>button.onclick=e=>{e.stopPropagation();const item=snapshot.items.find(i=>i.id===button.dataset.frameworkEdit);if(!item)return;const override=frameworkOverride(item);selectedAssemblyModule=override.id;openPlanModal();});
   $$("[data-framework-toggle]").forEach(b=>b.onchange=()=>{const item=snapshot.items.find(i=>i.id===b.dataset.frameworkToggle);if(item){frameworkOverride(item).enabled=b.checked;planDirty=true;submitPlan('plan:save','正在保存参与装配状态…',false);}render();});
   $$('[data-prune-chat]').forEach(button=>button.onclick=()=>{
-    const excluded=frameworkItems('chat').filter(item=>planState.modules.find(m=>m.source==='framework'&&m.targetIndex===messageIndex(item))?.enabled===false);
+    const excluded=frameworkItems('chat').filter(item=>findFrameworkModule(item)?.enabled===false);
     if(!excluded.length){setStatus('没有未参与装配的对话');return;}
     if(confirm(`将从当前实时 ChatHistory 删除 ${excluded.length} 条未参与装配的 user/assistant 消息。此操作会改变当前会话历史，是否继续？`)){
       planDirty=false;
@@ -1340,7 +1462,10 @@ function renderAssemblyBySource(plan){
     const unchecked=list.filter(m=>!m.enabled).length;
     return `<section class="assembly-lane source-lane"><div class="lane-body"><div class="lane-head"><h4><span class="source-chip ${esc(src)}">${esc(sname)}</span></h4><div class="lane-actions"><span class="source-count">${list.length} 个模块</span>${unchecked?`<button class="btn tiny" data-drop-unchecked-src="${esc(src)}" title="删除本来源中取消勾选的模块">删除未勾选 (${unchecked})</button>`:''}<button class="btn tiny danger" data-clear-source="${esc(src)}" title="删除本来源的全部模块">清空本来源</button><button class="btn tiny" data-plan-add-source="${esc(src)}">+ 新增</button></div></div><div class="module-stack">${list.map(m=>planModuleCard(m,plan,true)).join('')}</div></div></section>`;
   }).join('');
-  const liveAll=[...frameworkItems('features'),...frameworkItems('chat')].filter(i=>assemblyFilter.group==='all'||(assemblyFilter.group==='features'?messageIndex(i)>0:true));
+  // 运行时（Alife）消息：按各自归属区域取，不再用「是不是第 0 条」推断。
+  // 第 0 条（角色设定）已由上面的 native 模块代表，这里不再重复列出。
+  const liveAll=planGroups.map(([g])=>frameworkItems(g)).flat()
+    .filter(i=>assemblyFilter.group==='all'||liveGroupOf(i)===assemblyFilter.group)
   const liveSection=(assemblyFilter.source==='all' && liveAll.length) ? `<section class="assembly-lane source-lane"><div class="lane-body"><div class="lane-head"><h4><span class="source-chip framework">Alife 运行时</span></h4><div class="lane-actions"><span class="source-count">${liveAll.length} 个模块</span><button class="btn tiny danger" data-prune-chat>删除未参与装配的对话</button></div></div><div class="module-stack">${liveAll.map(frameworkModuleCard).join('')}</div></div></section>` : '';
   return (sections + liveSection) || '<div class="empty">当前筛选下没有模块。</div>';
 }
@@ -1395,26 +1520,96 @@ function openMacroSettings(){
   };
 }
 const planGroups=[["system","系统提示词"],["features","功能模块"],["memory","MemoryService 上下文"],["chat","对话窗口"]];
-function sortPlanGroups(){planState.modules.sort((a,b)=>planGroups.findIndex(g=>g[0]===(a.group||'system'))-planGroups.findIndex(g=>g[0]===(b.group||'system')));}
+// 装配计划里模块的显示次序：**先按区域**（system → features → memory → chat，与发送顺序一致），
+// **区域内部保持原有相对次序**。
+// ⚠️ 这里必须**稳定**：早先只写 `groupIndex(a)-groupIndex(b)`，同区域内的次序交给 sort 的实现决定 ——
+// 每次重排都可能换一个顺序，看上去就是「模块在界面上乱跳」。现在用「原下标」当第二排序键兜底，
+// 保证同区域内的模块永远保持它们在数组里的先后。
+function groupIndexOf(m){ const i=planGroups.findIndex(g=>g[0]===((m&&m.group)||'system')); return i<0?planGroups.length:i; }
+function sortPlanGroups(){
+  if(!planState) return;
+  planState.modules=planState.modules
+    .map((m,at)=>({m,at}))
+    .sort((a,b)=>groupIndexOf(a.m)-groupIndexOf(b.m) || a.at-b.at)
+    .map(x=>x.m);
+}
+// 一条实时消息属于哪个区域 —— 与后端 ContextPromptText.SourceGroup 同一套规则：
+// **只看消息自身**（角色 + 正文特征），不看它在数组里排第几。
+// 曾经这里靠 sourceKey + 下标是否大于零来推断，一旦提示词被插到中间就会错位分区。
+function liveGroupOf(i){
+  if(i.sourceKey!=='live-system'&&i.sourceKey!=='live-history'&&i.sourceKey!=='offline-history') return '';
+  if(i.kind!=='system') return i.category==='长期记忆'?'memory':'chat';
+  if(liveOrdinal(i)===0) return 'system';                        // 角色设定：历史第一条
+  const text=String(i.content||'');
+  if(/^\[功能说明\([^)]+\)\]/.test(text)) return 'features';      // 插件注册的功能说明
+  if(text.startsWith('[记忆存档(')) return 'memory';              // MemoryService 注入
+  return 'system';                                              // 用户自己加的 system 模块
+}
+// 运行时的**第 0 条**（角色设定）在装配页里由计划中那条 native 模块代表，不再单独列一张运行时卡片
+// —— 否则「角色设定」会在「按来源」视图里出现两次（一次来自计划 native、一次来自 Alife 运行时），
+// 看起来像被重复注入。只影响装配视图的展示；它本体在「上下文总览」等地方照常显示。
+function isRepresentedByPlan(i){
+  return i.sourceKey==='live-system' && liveOrdinal(i)===0;
+}
 function frameworkItems(group){
-  const rows=byOwner(selectedOwner).filter(i=>i.sourceKey==='live-system'||i.sourceKey==='live-history'||i.sourceKey==='offline-history');
-  if(group==='features') return rows.filter(i=>i.sourceKey==='live-system'&&messageIndex(i)>0);
-  if(group==='memory') return byOwner(selectedOwner).filter(i=>i.category==='长期记忆');
-  if(group==='chat') return rows.filter(i=>i.sourceKey!=='live-system'&&i.category!=='长期记忆').sort((a,b)=>messageIndex(a)-messageIndex(b));
-  return [];
+  return byOwner(selectedOwner)
+    .filter(i=>!isRepresentedByPlan(i) && liveGroupOf(i)===group)
+    .sort((a,b)=>liveOrdinal(a)-liveOrdinal(b));
 }
 function frameworkModuleCard(i){
- const feature=i.sourceKey==='live-system'&&messageIndex(i)>0;
- const m=feature?planState?.modules.find(m=>m.source==='framework'&&m.targetIndex===messageIndex(i)):null;
+ const group=liveGroupOf(i);
+ // 「功能说明」卡片用计划里那条模块的正文（可被改写）；其余原样显示。
+ const feature=group==='features';
+ const m=feature?findFrameworkModule(i):null;
  const role=String(m?.role||i.kind||'system').toLowerCase();
- const chat=i.sourceKey==='live-history';
- const participation=planState?.modules.find(m=>m.source==='framework'&&m.targetIndex===messageIndex(i));
- return `<article class="assembly-module framework-module" data-framework-id="${esc(i.id)}"><div class="module-card-top"><span class="module-order">${messageIndex(i)}</span><b>${esc(i.title)}</b><span class="identity-badge ${esc(role)}">${esc(role)}</span>${feature?`<button class="btn tiny" data-framework-edit="${esc(i.id)}">编辑</button><label class="module-enabled"><input type="checkbox" data-framework-toggle="${esc(i.id)}" ${m?.enabled!==false?'checked':''}/>参与装配</label>`:chat?`<label class="module-enabled"><input type="checkbox" data-framework-toggle="${esc(i.id)}" ${participation?.enabled!==false?'checked':''}/>参与装配</label>`:'<span></span>'}</div><p class="module-preview">${esc(feature?(m?.content??i.content):i.content).replace(/\s+/g,' ').slice(0,600)}</p><div class="module-card-meta"><span>${feature?'Alife 运行时功能模块':'实时对话消息'}</span><span>实际位置 #${messageIndex(i)}</span></div></article>`;
+ const chat=group==='chat';
+ const participation=m||findFrameworkModule(i);
+ const badge={features:'Alife 运行时功能模块',memory:'MemoryService 记忆存档',system:'系统提示词'}[group]||'实时对话消息';
+ // The live anchor is authoritative; legacy plan names may belong to another module.
+ const displayName=feature?frameworkDisplayName(i):i.title;
+ // ⚠️ 「同名模块出现两次」是用户实际报过的问题。两种成因要能一眼分清：
+ //   ① **真重复**：同一个模块往历史里插了两条几乎相同的说明（如 VirtualWorldService）；
+ //   ② **重复**：本插件自己插了两条。
+ // 光看名字和截断预览分不出来（两条正文前 600 字一模一样），所以这里补两样东西：
+ //   · **正文长度 + 内容指纹**：真重复时长度相同、指纹也相同；只是"前缀像"时指纹不同；
+ //   · 命中同名的其他卡片时，给一个「同名 · N 条」角标，明确告诉你「这不是你看花了」。
+ const rawBody=String(feature?(m?.content??i.content):i.content||"");
+ const bodyLen=rawBody.length;
+ const fp=fingerprint(rawBody);
+ const sameNameCount=byOwner(selectedOwner).filter(x=>liveGroupOf(x)===group
+   && (group==='features'
+       ? frameworkDisplayName(x)===displayName
+       : x.title===displayName)).length;
+ const dupBadge=sameNameCount>1?`<span class="dup-badge" title="历史里有 ${sameNameCount} 条同名消息，它们的正文可能不同（看下面的字数与指纹）">同名 · ${sameNameCount} 条</span>`:'';
+ return `<article class="assembly-module framework-module" data-framework-id="${esc(i.id)}"><div class="module-card-top"><span class="module-order">${liveOrdinal(i)}</span><b>${esc(displayName)}</b><span class="identity-badge ${esc(role)}">${esc(role)}</span>${dupBadge}${feature?`<button class="btn tiny" data-framework-edit="${esc(i.id)}">编辑</button><label class="module-enabled"><input type="checkbox" data-framework-toggle="${esc(i.id)}" ${m?.enabled!==false?'checked':''}/>参与装配</label>`:chat?`<label class="module-enabled"><input type="checkbox" data-framework-toggle="${esc(i.id)}" ${participation?.enabled!==false?'checked':''}/>参与装配</label>`:'<span></span>'}</div><p class="module-preview">${esc(rawBody).replace(/\s+/g,' ').slice(0,600)}</p><div class="module-card-meta"><span>${badge}</span><span title="正文字数 / 内容指纹（前 160 字）——两条同名卡片靠这个分辨">${bodyLen.toLocaleString()} 字 · ${fp}</span><span>实际位置 #${liveOrdinal(i)}</span></div></article>`;
+}
+// 正文内容指纹（前 160 字）。与后端 ContextPromptText.ShortHash 同口径，
+// 用途：**让「同名但内容不同」和「真重复」一眼可分** —— 这是「模块重复」类问题的关键分辨手段。
+function fingerprint(text){
+  const head=String(text|| "").replace(/\s+/g,' ').trim().slice(0,160);
+  let h1=0x811c9dc5, h2=0x01000193;
+  for(let i=0;i<head.length;i++){
+    const c=head.charCodeAt(i);
+    h1=Math.imul(h1^c,0x01000193)>>>0;
+    h2=Math.imul(h2^(c+0x9e37),0x85ebca6b)>>>0;
+  }
+  return (h1.toString(16).padStart(8,'0')+h2.toString(16).padStart(8,'0')).slice(0,12);
 }
 function frameworkOverride(item){
- let m=planState.modules.find(m=>m.source==='framework'&&m.targetIndex===messageIndex(item));
- if(!m){const group=item.sourceKey==='live-system'?'features':'chat';m={id:moduleId(),name:item.title,source:'framework',group,targetIndex:messageIndex(item),originalContent:item.content,originalRole:item.kind,enabled:true,role:item.kind,content:item.content};planState.modules.push(m);sortPlanGroups();planDirty=true;}
+ let m=findFrameworkModule(item);
+ if(!m){
+   // 区域由消息自身决定（与后端同一套规则）；不再假设「system 消息一律是 features」。
+   const group=liveGroupOf(item)||'chat';
+   // name 用**去掉 #N 后的标题**：模块名是给用户看的，不该随下标漂移。
+   // 下标只作为 targetIndex 保存，界面上另外用「实际位置 #N」展示，两件事分开。
+   m={id:moduleId(),name:frameworkDisplayName(item),source:'framework',group,targetIndex:messageIndex(item),anchorKey:anchorOf(item),originalContent:item.content,originalRole:item.kind,enabled:true,role:item.kind,content:item.content};
+   planState.modules.push(m);sortPlanGroups();planDirty=true;
+ }
  return m;
+}
+// 模块名 = 标题去掉尾部的 " #N"（那是位置，不是名字）。
+function frameworkDisplayName(item){
+ return anchorName(anchorOf(item)) || String(item.title||'').replace(/\s*#\d+\s*$/,'').trim() || item.title || '';
 }
 
 function roleOptions(role){return ['system','user','assistant'].map(r=>`<option ${r===String(role).toLowerCase()?'selected':''} value="${r}">${r}</option>`).join('');}
@@ -1450,19 +1645,51 @@ function bindExpandEditor(){
   };
 }
 function readPlanFields(m,prefix){
-  planDirty=true;
-  m.name=$('#'+prefix+'Name').value;m.role=$('#'+prefix+'Role').value;
+  // ⚠️ 这里以前第一行无条件 `planDirty=true`。后果不只是「多脏了一次」：
+  //   用户点一下模块**看一眼**（什么都没改）就会把自己标成「有未保存修改」，
+  //   于是后端推来的外部改动（AI 改的上下文）会被 plan-updated 分支判为「冲突」，
+  //   变成一条提示条而不是直接刷新 —— 用户看到的还是「AI 改的没同步」。
+  // 所以改成**先比对、确实变了才置脏**。写回去的值与已有值相同 ⇒ 不动 planDirty。
+  const readName = $('#'+prefix+'Name')?.value;
+  const readRole = $('#'+prefix+'Role')?.value;
+  const readGroup = $('#'+prefix+'Group')?.value;
+  const readOrder = Math.max(1, Number($('#'+prefix+'Order')?.value) || 1);
   // 截断的模块正文只是报文里的预览。写回去会把磁盘上的原文覆盖成预览，
   // 所以这里跳过 content —— 后端在 save / apply 时会按 Id 从磁盘计划里回填（RestoreTruncatedModules）。
-  if(!moduleTruncated(m)) m.content=$('#'+prefix+'Content').value;
-  m.group=$('#'+prefix+'Group').value;
-  const order=Math.max(1,Number($('#'+prefix+'Order').value)||1);
+  const readContent = moduleTruncated(m) ? undefined : $('#'+prefix+'Content')?.value;
+  // 右栏 Order 输入框显示的是「本区域内第几位」，用它和当前实际位置比。
+  //
+  // ⚠️ 正文比对**必须先规范化换行**：`<textarea>` 会把写进去的 `\r\n` 在读取时变成 `\n`
+  // （HTML 规范行为）。不规范化的话，一条含 CRLF 的正文**一打开就被判成「改过了」**——
+  // 于是用户只是点一下看看，界面就标成「有未保存修改」，AI 推来的更新只能变成一条提示条。
+  const normNl = (s) => (s ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const unchanged = (readName === undefined || readName === m.name)
+    && (readRole === undefined || readRole === m.role)
+    && (readGroup === undefined || readGroup === (m.group || 'system'))
+    && (readContent === undefined || normNl(readContent) === normNl(m.content))
+    && readOrder === planSideOrder(m);
+  if (unchanged) return;
+
+  planDirty=true;
+  // 只覆盖真的读到了的字段，避免把 m.name / m.role 写成 undefined。
+  if(readName !== undefined) m.name=readName;
+  if(readRole !== undefined) m.role=readRole;
+  // 正文：textarea 只会给出 `\n`，写回去时保持用户看到的样子（后端存的是正文，换行风格不该在这里被改）。
+  if(readContent !== undefined) m.content=readContent;
+  if(readGroup !== undefined) m.group=readGroup;
+  const order=readOrder;
   planState.modules=planState.modules.filter(x=>x.id!==m.id);
   const same=planState.modules.filter(x=>(x.group||'system')===m.group);
   const target=same[Math.min(order-1,same.length)];
   if(target)planState.modules.splice(planState.modules.indexOf(target),0,m);else {const last=same[same.length-1];if(last)planState.modules.splice(planState.modules.indexOf(last)+1,0,m);else planState.modules.push(m);}
   sortPlanGroups();
   if(m.source==='worldbook'){m.constant=$('#'+prefix+'Constant').checked;m.keywords=$('#'+prefix+'Keys').value.split(',').map(s=>s.trim()).filter(Boolean);}
+}
+// 模块在它所属区域里的 1-based 序号（右栏 Order 输入框显示的就是这个）。
+function planSideOrder(m){
+  const same=(planState?.modules||[]).filter(x=>(x.group||'system')===(m.group||'system'));
+  const at=same.indexOf(m);
+  return at < 0 ? 1 : at + 1;
 }
 // 报文瘦身是**每次下发**都做的，所以用户读过全文的模块在下一次 plan-state 里又会变回预览。
 // 直接把旧正文贴回来：否则「读完全文 → 编辑 → 保存 → 又变回预览」会让人以为读取白做了。
@@ -1580,7 +1807,8 @@ function moduleCardElement(m){
   const direct = document.querySelector(`[data-plan-select="${esc(m.id)}"]`);
   if (direct) return direct;
   if (m.source !== "framework") return null;
-  const item = snapshot?.items?.find(i => messageIndex(i) === m.targetIndex);
+  // 与 findFrameworkModule 同一套配对规则（指纹优先），否则「从这里跳过去」会跳错卡片。
+  const item = snapshot?.items?.find(i => i.owner === selectedOwner && findFrameworkModule(i)?.id === m.id);
   return item ? document.querySelector(`[data-framework-id="${esc(item.id)}"]`) : null;
 }
 function jumpToModule(id){
@@ -1611,7 +1839,7 @@ function renderPlanInspectorBody(){
   if(selectedAssemblyModule.startsWith('live:')) {
     const item=snapshot.items.find(i=>i.id===selectedAssemblyModule.slice(5));
     if(!item)return;
-    const override=item.sourceKey==='live-system'?planState?.modules.find(m=>m.source==='framework' && m.targetIndex===messageIndex(item)):null;
+    const override=item.sourceKey==='live-system'?findFrameworkModule(item):null;
     const isFrameworkModule=item.sourceKey==='live-system'&&messageIndex(item)>0;
     const editorValue=override?.content??item.content;
     $('#inspector').innerHTML=`<h3>${esc(item.title)}</h3><p class="inspector-tip">${isFrameworkModule ? '这是 Alife 当前生成的功能模块。这里保存的是插件覆盖草稿，只有应用“插件覆盖”后才会改变本次请求中的消息。' : '这是 Alife 当前运行时消息。保存后会直接写回对应的本地内容。'}</p><div class="field"><label>当前运行时消息 <small>只读</small></label><textarea class="inspector-content" readonly>${esc(item.content || '当前消息为空')}</textarea></div><div class="field"><label>${isFrameworkModule ? '插件覆盖草稿' : '编辑内容'} <small>${isFrameworkModule ? '保留原内容可取消覆盖' : '保存后立即写回'}</small></label><textarea class="inspector-content" id="liveContent">${esc(editorValue)}</textarea></div><div class="field"><label>输出身份</label><select id="liveRole">${roleOptions(override?.role||item.kind)}</select></div><div class="toolbar"><button class="btn" id="largeLive">编辑</button><button class="btn primary" id="saveLive">保存草稿</button></div>`;
@@ -1619,8 +1847,7 @@ function renderPlanInspectorBody(){
       // 这条正文可能只是预览（后端为控制报文体积截断过），直接写回会毁掉原文。
       if (guardTruncatedItem(item)) return;
       if(item.sourceKey==='live-system' && messageIndex(item)>0){
-        let m=planState.modules.find(m=>m.source==='framework'&&m.targetIndex===messageIndex(item));
-        if(!m){m={id:moduleId(),name:item.title,source:'framework',group:'features',targetIndex:messageIndex(item),originalContent:item.content,originalRole:item.kind,enabled:true};planState.modules.push(m);}
+        const m=frameworkOverride(item);
         m.role=$('#liveRole').value;m.content=$('#liveContent').value;
         submitPlan('plan:save','正在保存模块草稿…',false);
       }else send('item:update',{id:item.id,owner:item.owner,path:item.path,sourceKey:item.sourceKey,role:$('#liveRole').value,content:$('#liveContent').value});
@@ -2107,6 +2334,57 @@ function formatText(text) { return esc(text || "").replace(/\n/g,"<br>"); }
 function emptyMini(text) { return `<div class="empty">${esc(text)}</div>`; }
 function alertError(text) { openModal("提示", `<p class="plain-text">${esc(text)}</p>`); }
 
+// ── 「AI 改过上下文」的页内提示条 ────────────────────────────────────────────
+//
+// 为什么不是弹窗：外部改动可能连着来（AI 一次任务里 add + update + apply），
+// 弹窗会把用户正在做的事反复打断。所以做成**贴在页面顶部的一条**，看得见、但不抢焦点。
+//
+// 为什么需要它：用户在装配页有未保存改动时，后端推来的新计划**不能**直接覆盖草稿
+// （那会吞掉用户刚写的字）。但不覆盖就等于「AI 改了但你看不到」—— 那正是被报的 bug。
+// 所以两件事都要做：保留草稿 + 明确告诉用户「AI 改了，点这里看最新的」。
+function showExternalPlanNotice() {
+  const host = document.querySelector(".workspace") || document.body;
+  let bar = document.querySelector("#externalPlanNotice");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "externalPlanNotice";
+    bar.className = "external-plan-notice";
+    host.insertBefore(bar, host.firstChild);
+  }
+  const pending = externalPendingPlan;
+  const count = pending?.plan?.modules?.length;
+  // ⚠️ 这里**只能有一个 <button>**（就一个「载入最新」）。
+  // 「保留我的」做成链接样式 —— 它在语义上只是「把这条提示关掉」，不是主操作；
+  // 而且两个 button 会让「按标题定位这条提示里的按钮」变得有歧义（冒烟测试就撞过这个）。
+  bar.innerHTML = `<span class="epn-text"><b>AI 改了这个角色的上下文</b>`
+    + (count ? `（最新共 ${count} 个模块）` : "")
+    + `，但你这里有还没保存的修改，已为你保留。</span>`
+    + `<button class="btn tiny primary" id="externalPlanTake">载入最新</button>`
+    + `<a class="epn-dismiss" id="externalPlanKeep" role="button" tabindex="0">保留我的</a>`;
+  bar.querySelector("#externalPlanTake").onclick = () => adoptExternalPlan();
+  bar.querySelector("#externalPlanKeep").onclick = () => dismissExternalPlanNotice();
+}
+
+function dismissExternalPlanNotice() {
+  document.querySelector("#externalPlanNotice")?.remove();
+}
+
+// 用户点「载入最新」：丢弃自己的草稿，换成 AI 那份。
+// 这是**用户主动选择**的结果，所以不再二次确认；但要说清「你的草稿被换掉了」。
+function adoptExternalPlan() {
+  const pending = externalPendingPlan;
+  dismissExternalPlanNotice();
+  if (!pending || pending.owner !== selectedOwner) { externalPendingPlan = null; return; }
+  externalPendingPlan = null;
+  loadedPlanModules.clear();
+  planState = pending.plan || null;
+  planDirty = false;
+  if (planState) { normalizePlan(planState); cachePlan(selectedOwner, planState); }
+  setStatus("已载入 AI 的最新改动");
+  if (currentView === "assembly") render();
+  autoFetchPlanModules();
+}
+
 function openMessage(id) {
   if (loadingItems.has(id)) return;
   loadingItems.add(id);
@@ -2176,6 +2454,21 @@ function answerCardWorldbookAsk(msg, accepted) {
   closeModal();
   send("card-worldbook-answer", { requestId: msg.requestId, accepted, remember });
 }
+
+// ── 【2026-10-02 已删除】角色改上下文的审批弹窗 ─────────────────────────────
+//
+// 这里以前有一整套「后端问、前端答」的审批弹窗（`showAgentAsk` / `answerAgentAsk` /
+// `AGENT_RISK_NOTE` / `agent-ask` 报文 / `agent-answer` 回包）。
+//
+// **整体删除的原因**：用户实测该弹窗**从来没有真正弹出来过**，而后端会 `await` 用户回答 ——
+// 于是 AI 一调 `AgentContextAdd`，后端就永久卡在那个 await 上，UI 上一直显示
+// 「执行 AgentContextAdd 函数丨分析对话」，**整个会话的发送通道被占死，用户再也发不出消息**。
+//
+// 一个「只在弹窗真的会出现时才安全」的机制，在前提不成立时就是一个必然卡死的陷阱，
+// 而且卡死的代价是**整个对话不能用** —— 远大于它想防住的那点风险。因此彻底移除。
+//
+// 现在角色改上下文的门禁只剩配置页那两个开关（允许改自己 / 允许改别人），
+// 后端同步判定、立即返回，**绝不等待任何用户输入**。
 
 function ensureWorldBook(owner) {
   if (ownerInfo(owner).active && !worldBooks[owner]) send("worldbook:get", { owner });
@@ -2287,6 +2580,40 @@ window.require("electron").ipcRenderer.on(ipcChannel, (event, raw) => {
     setStatus("计划已就绪");
     if (currentView === "assembly") render();
     // 把「只有预览」的模块排进后台队列。放在 render 之后：先让用户看到结构，再慢慢补正文。
+    autoFetchPlanModules();
+  } else if (msg.type === "plan-updated") {
+    if (msg.owner !== selectedOwner) return;
+    // 「外部改动」专用报文：AI（角色）通过 agentcontextadd / update / delete / import /
+    // 切快照改完计划之后，后端用这条把新计划推过来。与 plan-state 的区别只有一条：
+    // **它必须能被用户看见**，所以不能被 planDirty 直接丢掉。
+    //
+    // 三条规则（与后端 NotifyPlanChangedFromAgent 一一对应）：
+    //   ① 用户没有未保存改动 → 直接换成新计划，新模块立刻出现在列表里（这就是报的那个 bug）；
+    //   ② 用户正在编辑（planDirty）→ **绝不覆盖**用户手上的草稿，但必须给出可见提示，
+    //      否则用户永远不知道 AI 改过东西；提示里带一个「载入最新」按钮，点了才覆盖。
+    //   ③ 外部改动一律作废旧的「已读全文」缓存：模块正文可能已被 AI 改写，
+    //      继续拿本地那份旧全文会让界面显示过期内容。
+    clearTimeout(planTimer); planLoading = false;
+    const incoming = msg.plan || null;
+    if (planDirty) {
+      externalPendingPlan = { owner: msg.owner, plan: incoming };
+      setStatus("AI 改了上下文，但你这里有未保存的修改", false);
+      showExternalPlanNotice();
+      return;
+    }
+    planOwner = msg.owner;
+    externalPendingPlan = null;
+    const previous = planState;
+    loadedPlanModules.clear();          // 规则③：外部改动作废旧全文缓存
+    planState = incoming;
+    planDirty = false;
+    if (planState) {
+      normalizePlan(planState);
+      keepLoadedModuleContent(planState, previous);
+      cachePlan(msg.owner, planState);
+    }
+    setStatus("AI 已更新上下文，界面已同步");
+    if (currentView === "assembly") render();
     autoFetchPlanModules();
   } else if (msg.type === "plan-error") {
     if(msg.owner!==selectedOwner)return;
@@ -2479,6 +2806,11 @@ window.require("electron").ipcRenderer.on(ipcChannel, (event, raw) => {
   } else if (msg.type === "card-worldbook-ask") {
     // 后端在 await 这个答案：一定要回答（两个按钮 / × / 点遮罩都会回答）。
     showCardWorldbookAsk(msg);
+  } else if (msg.type === "agent-ask") {
+    // 【2026-10-02 已废弃】审批弹窗机制整体删除（它导致工具调用永久挂住整个对话）。
+    // 后端已不再发这个报文；万一收到旧版后端发来的，也不能让消息静静丢掉 ——
+    // 记一条 trace 便于排查，但**绝不显示弹窗**（显示也没人会点，后端也不再等）。
+    trace("ignored legacy agent-ask (approval flow removed)");
   } else if (msg.type === "import-options") {
     // 只更新下拉框与说明，不 render()：这个回包可能是页面渲染时发出的请求触发的。
     importOptions = { cardWorldbook: msg.cardWorldbook || "ask" };

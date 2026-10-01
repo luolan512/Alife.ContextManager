@@ -26,6 +26,39 @@ public sealed class ContextItem
     public string Source { get; set; } = "";
     public string SourceKey { get; set; } = "";
     public string Origin { get; set; } = "live";
+    /// <summary>
+    /// 这条实时消息的**身份指纹** —— 用来在对话历史发生变化（前部被裁剪、中间插入新消息）之后，
+    /// 依然能认出「装配计划里的那个模块」对应的是哪一条消息。
+    ///
+    /// <para>
+    /// 为什么需要它：装配计划里的 framework 模块以前只存 <see cref="ContextPlanModule.TargetIndex"/>
+    /// （消息在 <c>ChatBot.ChatHistory</c> 数组里的下标）。下标不是身份 —— 历史一变，
+    /// 原来第 3 条就成了第 2 条，而计划里记的还是 3，于是界面上「模块名字」与「模块内容」
+    /// 配到了两条不同的消息，看起来就是错位。
+    /// </para>
+    /// <para>
+    /// 只有来自实时对话历史（<c>live-system</c> / <c>live-history</c>）的条目才有值；
+    /// 磁盘上的条目（记忆、角色卡等）本来就是按路径 / Id 定位的，不需要它。
+    /// 格式：<c>来源|角色|函数说明名或正文指纹</c>，由 <c>ContextManagerRuntime.ComputeAnchorKey</c> 生成。
+    /// </para>
+    /// </summary>
+    public string AnchorKey { get; set; } = "";
+    /// <summary>
+    /// 这条实时条目在 <c>ChatBot.ChatHistory</c> 里的**真实次序**（仅 live-system / live-history 有值，其余为 -1）。
+    ///
+    /// <para>
+    /// 为什么不用 <see cref="Title"/> 里的 <c>#N</c> 排序：那个 <c>#N</c> 也是历史下标，
+    /// 但它只是**字符串**的一部分 —— 前端要用正则去抠，一旦标题格式变了（例如某类消息换了个命名）
+    /// 就会抠错或抠不到，退化成 <c>-1</c>，排序随之乱掉。更要命的是前端拿到的 item 可能来自
+    /// 不同批次（部分走 <c>items:page</c> 补全），靠解析标题很容易出现「同一批里有的有 #、有的没有」。
+    /// </para>
+    /// <para>
+    /// 这里直接由后端在采集时赋一个**明确的整数**，前端排它即可，不需要解析字符串。
+    /// 它同样是历史下标、同样会随历史变动而变 —— 但它的语义是「**本次快照里这条消息排第几**」，
+    /// 只用于**显示排序**，绝不用于身份配对（配对一律走 <see cref="AnchorKey"/>）。
+    /// </para>
+    /// </summary>
+    public int LiveOrder { get; set; } = -1;
     public long Size { get; set; }
     public int EstimatedTokens { get; set; }
     public bool Enabled { get; set; } = true;

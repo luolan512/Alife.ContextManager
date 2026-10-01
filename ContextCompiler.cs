@@ -25,10 +25,11 @@ public static class ContextCompiler
             if (!Groups.Contains(m.Group)) throw new InvalidOperationException("无效的模块区域：" + m.Group);
             m.Role = Role(m.Role); m.Content ??= ""; m.Keywords ??= new(); m.SecondaryKeywords ??= new();
         }
+        ContextPromptText.NormalizeFrameworkNames(plan.Modules);
         plan.ScanDepth = Math.Clamp(plan.ScanDepth, 1, 1000);
     }
     /// <param name="warnings">
-    /// 可选：收集“降级处理”的说明。运行时装配（ContextTransform）会在每次请求时执行，
+    /// 可选：收集“降级处理”的说明。运行时装配（ChatSent 请求前重排）会在每次请求时执行，
     /// 一旦抛异常就会把整轮对话打断，所以这里对“原生模块已变化”这类可恢复情况改为
     /// 保留原始消息并记一条 warning，而不是 throw。结构性错误（模板块不闭合等）仍然抛。
     /// </param>
@@ -36,6 +37,9 @@ public static class ContextCompiler
     {
         Validate(plan);
         if (plan.Mode == "Off") return source;
+        ContextPromptText.MigrateFrameworkModules(plan, source);
+        var resolved = ContextPromptText.ResolveFrameworkIndices(plan.Modules, source);
+        var byPosition = resolved.ToDictionary(p => p.Value, p => p.Key);
         var result = new ChatHistory();
         var scan = string.Join("\n", source.Where(m => m.Role != AuthorRole.System).TakeLast(plan.ScanDepth).Select(m => m.Content));
         var env = Environment(index, owner, plan.UserName, plan.CustomMacros);
@@ -47,10 +51,12 @@ public static class ContextCompiler
         // 结果是在原生对话窗口每发一条消息都报错；现在退回原始消息，保证对话可用。
         bool Stale(ContextPlanModule m, ChatMessageContent original) =>
             original.Content != m.OriginalContent || original.Role.Label != m.OriginalRole;
+        ContextPlanModule? ModuleAt(int position)
+            => byPosition.TryGetValue(position, out var module) ? module : null;
         void AddSource(int position) {
             var original = source[position];
-            var edit = plan.Modules.FirstOrDefault(m=>m.Source=="framework" && m.TargetIndex==position);
-            var sourceGroup = position > 0 && original.Role == AuthorRole.System ? "features" : "chat";
+            var edit = ModuleAt(position);
+            var sourceGroup = GroupOf(position);
             if (edit == null) { result.Add(original); return; }
             if (Stale(edit, original)) { Warn("原生模块已变化，已保留原文：" + edit.Name); result.Add(original); return; }
             if (edit.Group != sourceGroup) return;
@@ -60,8 +66,9 @@ public static class ContextCompiler
             foreach (var m in plan.Modules.Where(m => m.Group == group && m.Enabled && (m.Source != "framework" || IsMovedFrameworkModule(m, group)))) {
                 if (m.Source == "framework")
                 {
-                    if (m.TargetIndex < 0 || m.TargetIndex >= source.Count) { Warn("原生模块位置已越界，已跳过：" + m.Name); continue; }
-                    var original = source[m.TargetIndex];
+                    var position = IndexOfFrameworkModule(m);
+                    if (position < 0) { Warn("原生模块已失联（该消息已不在历史中），已跳过：" + m.Name); continue; }
+                    var original = source[position];
                     if (Stale(m, original)) { Warn("原生模块已变化，已跳过替换：" + m.Name); continue; }
                     result.Add(new ChatMessageContent(new AuthorRole(Role(m.Role)), plan.ApplyMacros ? Render(m.Content,env,vars, null, autoMacros) : m.Content));
                     continue;
@@ -75,22 +82,32 @@ public static class ContextCompiler
                 if (!string.IsNullOrWhiteSpace(text)) result.Add(new ChatMessageContent(new AuthorRole(Role(m.Role)), text));
             }
         }
+        int IndexOfFrameworkModule(ContextPlanModule m)
+            => resolved.TryGetValue(m, out var at) ? at : -1;
         bool IsMovedFrameworkModule(ContextPlanModule m, string group)
         {
-            if (m.TargetIndex < 0 || m.TargetIndex >= source.Count) return false;
-            var original = source[m.TargetIndex];
-            var sourceGroup = m.TargetIndex > 0 && original.Role == AuthorRole.System ? "features" : "chat";
-            return sourceGroup != group;
+            var position = IndexOfFrameworkModule(m);
+            if (position < 0) return false;
+            return GroupOf(position) != group;
         }
-        Add("system");
-        // index[0] is the replaced region; all framework messages after it remain intact.
-        int cursor = source.Count > 0 ? 1 : 0;
-        while (cursor < source.Count && source[cursor].Role == AuthorRole.System) AddSource(cursor++);
-        Add("features");
-        while (cursor < source.Count && (source[cursor].Content ?? "").StartsWith("[记忆存档(")) AddSource(cursor++);
-        Add("memory");
-        while (cursor < source.Count) AddSource(cursor++);
-        Add("chat");
+        // 一条消息属于哪个区域：**只看消息自身，不看它排第几**。
+        // （判定规则统一放在 ContextPromptText.SourceGroup，前端与装配侧共用同一套。）
+        string GroupOf(int position) =>
+            ContextPromptText.SourceGroup(position, source[position].Role.Label, source[position].Content);
+        // 区域按固定顺序输出：system → features → memory → chat。
+        // ⚠️ 这里**不再**用「cursor 顺序扫 + system 连续」那套分段假设。
+        // 每条消息先各自算出归属区域，再按区域分桶，桶内保持它原来的先后顺序。
+        // 于是「提示词被插到中间 / 末尾」不会让任何消息错位 —— 它只会进入自己该在的那一桶。
+        for (var g = 0; g < Groups.Length; g++)
+        {
+            var group = Groups[g];
+            // system 区域就是 index 0 那一条（角色设定），它由 Add("system") 的
+            // native 模块统一接管；这里只处理另外三个区域。
+            if (group == "system") { Add(group); continue; }
+            for (var i = 0; i < source.Count; i++)
+                if (GroupOf(i) == group) AddSource(i);
+            Add(group);
+        }
         return result;
     }
     public static Dictionary<string,string> Environment(JObject index, string owner, string user, IDictionary<string,string>? custom = null)

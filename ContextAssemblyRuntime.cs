@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -18,7 +17,24 @@ namespace Marisa.ContextManager;
 public sealed partial class ContextManagerRuntime
 {
     // 注意：这里以前有一个 `int references;`，全项目只声明、从未读写 —— 已删除。
-    readonly Dictionary<object, Func<ChatHistory,ChatHistory>> transforms = new();
+    //
+    // 【第三十二轮：把「请求前重排」从 ContextTransform 反射改成官方事件订阅】
+    // 老做法是反射去挂 LanguageModel 上一个叫 ContextTransform 的私有属性 —— 那是别人给
+    // OpenAI 插件硬加的口子，不属于 Alife 官方 API（官方源码全库搜 ContextTransform 零命中，
+    // ILanguageModel 只有 ChatStreamingAsync 一个方法，没有任何请求前钩子）。
+    // 强依赖它的后果：一旦这个私有口子没了（插件回退/换模型），请求前重排整条链路直接死掉。
+    //
+    // 现在改用官方 ChatBot.ChatSent 事件：ChatBot.ChatAsync 的时序是
+    //   127  EditChatHistoryAsync(装载用户消息)   ← 用户消息进历史
+    //   136  ChatSent?.Invoke(...)                ← 我们在这里
+    //   149  EditChatHistoryAsync(真请求)         ← 语言模型读到的是我们重排后的历史
+    // 且 ChatSent 触发时 chatHistorySemaphore 已被第 127 行那次编辑释放，
+    // 所以在回调里同步调 EditChatHistory 不会死锁。
+    //
+    // 键从「LanguageModel 对象」换成「ChatBot 对象」：事件挂在 ChatBot 上，
+    // 而 LanguageModel 可能在运行时被换（重载插件），挂错对象就会漏摘/漏挂。
+    readonly Dictionary<ChatBot, Action<string>> chatSentSubscriptions = new();
+    readonly object chatSentGate = new();
     JObject ReadIndex(string owner) {
         var character = GetCharacterRequired(owner);
         var dir = ResolveCharacterDirectory(character, FindStorageRoot()) ?? throw new InvalidOperationException("角色目录不存在");
@@ -94,33 +110,52 @@ public sealed partial class ContextManagerRuntime
         catch { return null; }
     }
 
-    void AttachTransform(ChatActivity activity) {
-        var model = activity.ChatBot?.LanguageModel;
-        if (model == null) return;
-        lock (transforms) {
-            if (transforms.ContainsKey(model)) return;
-            var property = model.GetType().GetProperty("ContextTransform");
-            if (property?.PropertyType != typeof(Func<ChatHistory,ChatHistory>)) return;
-            if (property.GetValue(model) != null) return;
-            Func<ChatHistory,ChatHistory> transform = history => {
-                // 这个委托在**每一次**请求前执行，抛异常会直接把原生对话窗口的整轮对话打断
-                // （OpenAI 插件的 BuildRequest 抛错 → 界面上就是“对话报错”）。
-                // 因此这里必须兜底：任何计划/文件/宏问题都只降级为“按原文发送”，绝不外抛。
-                try {
-                    var index = ReadIndex(activity.Character.Name);
-                    var plan = ResolveActivePlan(activity.Character.Name, index);
-                    if (plan == null || plan.Mode != "Temporary") return history;
-                    var warnings = new List<string>();
-                    var compiled = ContextCompiler.Compile(history, plan, index, activity.Character.Name, warnings);
-                    foreach (var warning in warnings)
-                        ContextTrace.Write("transform warn owner=" + activity.Character.Name + " : " + warning);
-                    return compiled;
-                } catch (Exception ex) {
-                    ContextTrace.Write("transform FAILED owner=" + activity.Character.Name + " : " + ex.GetType().Name + ": " + ex.Message + "（已按原文发送，未打断对话）");
-                    return history;
-                }
-            };
-            property.SetValue(model, transform); transforms.Add(model, transform);
+    /// <summary>
+    /// 给一个会话挂上「请求前重排」：订阅官方 ChatBot.ChatSent 事件。
+    /// 返回是否处于挂载态（已挂 或 本次挂上）。
+    /// </summary>
+    bool AttachTransform(ChatActivity activity) {
+        var bot = activity?.ChatBot;
+        if (bot == null) return false;
+        lock (chatSentGate) {
+            if (chatSentSubscriptions.ContainsKey(bot)) return true;
+            // 闭包里只捕获 bot 与 owner（值类型字符串），不捕获 activity，避免旧运行时被整条
+            // 会话链闭包引用着无法回收。
+            var owner = activity!.Character?.Name ?? "";
+            if (string.IsNullOrWhiteSpace(owner)) return false;
+            Action<string> handler = _ => ReorderBeforeSend(bot, owner);
+            bot.ChatSent += handler;
+            chatSentSubscriptions[bot] = handler;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 请求前重排：ChatBot.ChatSent 触发时（用户消息已装载、语言模型请求未发出）就地改写会话历史。
+    /// 这段代码运行在**每一次**请求前，抛异常会把原生对话窗口的整轮对话打断，
+    /// 因此全程兜底：任何计划/文件/宏问题都只降级为「按原文发送」，绝不外抛。
+    /// </summary>
+    void ReorderBeforeSend(ChatBot bot, string owner) {
+        try {
+            var index = ReadIndex(owner);
+            var plan = ResolveActivePlan(owner, index);
+            if (plan == null || plan.Mode != "Temporary") return;
+            // bot.ChatHistory 是对外快照（IReadOnlyList），Compiler 要 ChatHistory —— 按序拷一份。
+            // 这一步必须在 EditChatHistory 之外做（快照语义），避免在持有 chatHistorySemaphore 时重入读取。
+            var source = new ChatHistory();
+            foreach (var message in bot.ChatHistory) source.Add(message);
+            var warnings = new List<string>();
+            var compiled = ContextCompiler.Compile(source, plan, index, owner, warnings);
+            foreach (var warning in warnings)
+                ContextTrace.Write("reorder warn owner=" + owner + " : " + warning);
+            // ChatSent 触发时第 127 行那次 EditChatHistory 已释放 chatHistorySemaphore，
+            // 这里同步调 EditChatHistory 不会死锁。用「整体替换」语义：清空后按编译结果重填。
+            bot.EditChatHistory(thread => {
+                thread.ChatHistory.Clear();
+                foreach (var message in compiled) thread.ChatHistory.Add(message);
+            }, "ContextManager 请求前重排");
+        } catch (Exception ex) {
+            ContextTrace.Write("reorder FAILED owner=" + owner + " : " + ex.GetType().Name + ": " + ex.Message + "（已按原文发送，未打断对话）");
         }
     }
 
@@ -143,8 +178,7 @@ public sealed partial class ContextManagerRuntime
                 return false;
             }
             AtomicWrite(TempPlanPath(owner), JsonConvert.SerializeObject(plan, Formatting.Indented));
-            AttachTransform(activity);
-            var attached = activity.ChatBot?.LanguageModel != null && transforms.ContainsKey(activity.ChatBot.LanguageModel);
+            var attached = AttachTransform(activity);
             ContextTrace.Write($"auto attach owner={owner} mode={plan.Mode} modules={plan.Modules.Count} attached={attached}");
             return attached;
         }
@@ -163,29 +197,23 @@ public sealed partial class ContextManagerRuntime
         }
         catch (Exception ex) { ContextTrace.Write("auto attach all failed: " + ex.Message); }
     }
-    void OnActivityDeactivated(ChatActivity activity) {
-        var model=activity.ChatBot?.LanguageModel;
-        if(model==null)return;
-        lock(transforms) {
-            if(transforms.Remove(model,out var callback)) {
-                var p=model.GetType().GetProperty("ContextTransform");
-                if(Equals(p?.GetValue(model),callback)) p!.SetValue(model,null);
-            }
+    void DetachTransform(ChatBot? bot) {
+        if (bot == null) return;
+        lock (chatSentGate) {
+            if (chatSentSubscriptions.Remove(bot, out var handler)) bot.ChatSent -= handler;
         }
     }
+    void OnActivityDeactivated(ChatActivity activity) => DetachTransform(activity?.ChatBot);
     /// <summary>
-    /// 摘掉所有挂在 LanguageModel.ContextTransform 上的委托。由 Release()（插件卸载）调用，
-    /// 以及角色停用时按模型逐个摘（见 OnActivityDeactivated）。
-    /// 不做的话：插件重载后新运行时挂不上（属性非空即返回），插件覆盖静默失效，
+    /// 摘掉所有挂在 ChatBot.ChatSent 上的委托。由 Release()（插件卸载）调用，
+    /// 以及角色停用时按会话逐个摘（见 OnActivityDeactivated）。
+    /// 不做的话：插件重载后旧订阅还挂在活着的 ChatBot 上，同一个会话会被重排两次，
     /// 且旧运行时被闭包引用着无法回收。
     /// </summary>
     void DetachTransforms() {
-        lock (transforms) {
-            foreach (var pair in transforms) {
-                var p = pair.Key.GetType().GetProperty("ContextTransform");
-                if (Equals(p?.GetValue(pair.Key), pair.Value)) p!.SetValue(pair.Key, null);
-            }
-            transforms.Clear();
+        lock (chatSentGate) {
+            foreach (var pair in chatSentSubscriptions) pair.Key.ChatSent -= pair.Value;
+            chatSentSubscriptions.Clear();
         }
     }
     void PlanOperation(string owner, Action action) {
@@ -252,13 +280,29 @@ public sealed partial class ContextManagerRuntime
         // before applying a selected module so long messages pass validation.
         var history = FindActivity(owner)?.ChatBot.ChatHistory;
         if (history != null)
-        foreach (var module in plan.Modules.Where(m => m.Source == "framework" && m.TargetIndex >= 0 && m.TargetIndex < history.Count))
         {
-            var original = history[module.TargetIndex];
-            module.OriginalContent = original.Content ?? "";
-            module.OriginalRole = original.Role.Label;
+            ContextPromptText.MigrateFrameworkModules(plan, history);
+            var resolved = ContextPromptText.ResolveFrameworkIndices(plan.Modules, history);
+            foreach (var pair in resolved)
+            {
+                var original = history[pair.Value];
+                pair.Key.OriginalContent = original.Content ?? "";
+                pair.Key.OriginalRole = original.Role.Label;
+            }
+            // Unresolved overrides are retained for recovery; never rebind them by position.
         }
         return plan;
+    }
+
+    // UI operations and request compilation share the same one-to-one identity resolver.
+    internal static int ResolveFrameworkIndex(ContextPlanModule module, IReadOnlyList<ChatMessageContent> history)
+        => ResolveFrameworkIndex(module, history, null);
+
+    internal static int ResolveFrameworkIndex(ContextPlanModule module, IReadOnlyList<ChatMessageContent> history,
+        IReadOnlyList<ContextPlanModule>? plan)
+    {
+        var resolved = ContextPromptText.ResolveFrameworkIndices(plan ?? new[] { module }, history);
+        return resolved.TryGetValue(module, out var at) ? at : -1;
     }
     static void FillNativePlanPrompt(ContextPlan plan, Character character, string? storageRoot)
     {
@@ -327,6 +371,9 @@ public sealed partial class ContextManagerRuntime
     /// <summary>下发计划。返回被瘦身（正文只发了预览）的模块数，调用方可以据此提示用户。</summary>
     int SendPlan(string owner, ContextPlan plan)
     {
+        var history = FindActivity(owner)?.ChatBot.ChatHistory;
+        if (history != null) ContextPromptText.MigrateFrameworkModules(plan, history);
+        ContextPromptText.NormalizeFrameworkNames(plan.Modules);
         JObject wire;
         long fullBytes;
         try
@@ -354,6 +401,47 @@ public sealed partial class ContextManagerRuntime
     /// </summary>
     static int ShrinkPlanForWire(JObject wire, long fullBytes, int budgetBytes)
         => ContextStateBudget.ShrinkPlanForWire(wire, fullBytes, budgetBytes);
+
+    /// <summary>
+    /// 下发「**外部改动**」的计划：报文类型是 <c>plan-updated</c> 而不是 <c>plan-state</c>。
+    ///
+    /// <para><b>为什么要单独一个类型：</b>两者的语义完全不同 ——</para>
+    /// <list type="bullet">
+    /// <item><c>plan-state</c> = 「你请求的那份计划回来了」。前端处理时**遇到 <c>planDirty</c>
+    /// 就整个丢弃**（<c>if (planDirty) return;</c>），因为那通常只是自己刚发出去的请求的回声，
+    /// 覆盖会打乱正在编辑的草稿。</item>
+    /// <item><c>plan-updated</c> = 「**别人**（角色 / AI）把计划改了」。这条**不能被静默丢弃** ——
+    /// 丢了就正是用户报的那个 bug：AI 明明加了模块，界面上却什么都没有，必须关掉重开才看得到。</item>
+    /// </list>
+    ///
+    /// <para>前端对 <c>plan-updated</c> 的约定：没在编辑就直接换上新计划；正在编辑就**保留草稿**
+    /// 并弹一条「AI 改过，点这里看最新的」提示条（见 app.js 的 <c>plan-updated</c> 分支）。</para>
+    ///
+    /// <para>瘦身逻辑与 <see cref="SendPlan"/> 完全一致（共用 <c>ShrinkPlanForWire</c>），
+    /// 否则一条大计划会把这个新报文变成顶断 IPC 桥的入口。</para>
+    /// </summary>
+    void SendPlanUpdated(string owner, ContextPlan plan)
+    {
+        var history = FindActivity(owner)?.ChatBot.ChatHistory;
+        if (history != null) ContextPromptText.MigrateFrameworkModules(plan, history);
+        ContextPromptText.NormalizeFrameworkNames(plan.Modules);
+        JObject wire;
+        long fullBytes;
+        try
+        {
+            wire = JObject.FromObject(plan, Newtonsoft.Json.JsonSerializer.Create(ContextJsonSettings.Wire));
+            fullBytes = ContextStateBudget.EscapedBytes(wire.ToString(Formatting.None));
+        }
+        catch (Exception ex)
+        {
+            ContextTrace.Write($"plan-updated wire measure failed owner={owner}: {ex.Message}");
+            SendWindow("plan-updated", new { owner, plan });
+            return;
+        }
+        var truncatedModules = fullBytes > PlanWireBudgetBytes ? ShrinkPlanForWire(wire, fullBytes, PlanWireBudgetBytes) : 0;
+        ContextTrace.Write($"plan-updated owner={owner} modules={plan.Modules.Count} truncated={truncatedModules} full={fullBytes}B");
+        SendWindow("plan-updated", new { owner, plan = wire, truncatedModules, fullBytes });
+    }
 
     /// <summary>取单个模块的完整正文（计划被瘦身下发后，装配页按需读取）。</summary>
     void GetPlanModule(string owner, JsonElement payload)
@@ -424,6 +512,7 @@ public sealed partial class ContextManagerRuntime
                     }
                 };
             }
+            ContextPromptText.MigrateFrameworkModules(plan, activity.ChatBot.ChatHistory);
             FillNativePlanPrompt(plan, ReadActiveCharacterFromDisk(character, FindStorageRoot()), FindStorageRoot());
             try { service.SavePlan(owner, plan); }
             catch (Exception saveEx) { logger.LogWarning(saveEx, "保存计划失败，但仍返回内存计划 {Owner}", owner); }
@@ -482,9 +571,11 @@ public sealed partial class ContextManagerRuntime
         var unresolved=CollectUnresolvedMacros(plan,index,owner);
         var activity=FindActivity(owner);
         if (plan.Mode=="Temporary" && activity!=null) {
-            AttachTransform(activity);
-            lock(transforms) if (!transforms.ContainsKey(activity.ChatBot.LanguageModel))
-                throw new InvalidOperationException("当前语言模型没有 ContextTransform 接口，请先重载已更新的 OpenAI 语言模型插件。");
+            // 第三十二轮：这里以前会在挂载失败时抛「当前语言模型没有 ContextTransform 接口」，
+            // 那是强依附别人插件的私有口子。现在挂的是官方 ChatBot.ChatSent 事件，
+            // 任何语言模型都能用，没有“接口缺失”这回事 —— 所以不再抛异常，只记日志。
+            var attached = AttachTransform(activity);
+            ContextTrace.Write($"apply attach owner={owner} attached={attached}");
         }
         if (plan.Mode=="Permanent") {
             var localPrompt = RenderLocalOverride(owner, plan, index);
@@ -512,7 +603,7 @@ public sealed partial class ContextManagerRuntime
         } else if(plan.Mode=="Temporary") AtomicWrite(TempPlanPath(owner),JsonConvert.SerializeObject(plan,Formatting.Indented));
         else {
             // 关闭：撤掉请求前重组，并清掉 index.json 里遗留的 ContextManagerPlan
-            // （OpenAI 插件在没有 ContextTransform 时会读它，留着会让“关闭”名不副实）。
+            // （旧版遗留数据，留着会让“关闭”名不副实）。
             if(File.Exists(TempPlanPath(owner))) File.Delete(TempPlanPath(owner));
             if (activity != null) OnActivityDeactivated(activity);
             if (index["ContextManagerPlan"] != null)

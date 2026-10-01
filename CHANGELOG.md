@@ -3,7 +3,337 @@
 > 这份文件是按轮次累积的开发记录（每一轮解决了什么、为什么这么改、踩了哪些坑），
 > 面向维护者。**使用者请看 [README.md](README.md)。**
 
-当前版本：`2026-09-30p`
+当前版本：`2026-10-02ah`
+
+## 第三十三轮（删除审批弹窗 —— 「等用户点弹窗」的准入机制会把整个对话卡死）
+
+用户反馈：
+> 「有时候执行完，执行 AgentContextAdd 函数丨分析对话，会执行成功，但是在之后，
+> 我想继续对话，结果发现结果**被一直这个：执行 AgentContextAdd 函数丨分析对话；给占用住了，
+> 发言发不出去了**」
+> 「实际上我没有看到过那个**审批弹窗**」
+
+### 根因：准入判定 `await` 一个永远等不到的回答
+
+`CheckAgentAccessAsync` 在「改别人 + 对方没启用插件覆盖」这条分支里：
+
+```
+await AskAgentAsync(...)                    ← 卡在这里
+  → SendWindow("agent-ask", ...)            ← 发弹窗请求给渲染进程
+  → await tcs.Task                          ← 等用户点「同意 / 拒绝」
+```
+
+**弹窗从来没有真正显示出来**（用户明确说没见过）⇒ 用户不可能回答 ⇒
+那个 `TaskCompletionSource` 永远不会 `SetResult` ⇒ 这次工具调用**永久挂起**。
+`XmlHandler` 的 Invoker 在 `await` 这个工具调用，工具调用不返回，框架的对话轮次就完不成 ——
+于是**整个会话的发送通道被这次调用占死**，UI 上一直显示「执行 AgentContextAdd 函数丨分析对话」。
+
+⚠️ 那段 `while (true) { await Task.WhenAny(tcs.Task, Task.Delay(5000)) }` 看起来像超时保护，
+其实是个**假保险**：它只在「插件窗口被关掉」时才 `break`。窗口一直开着但弹窗没渲染出来，
+这个循环就永远转下去 —— **有轮询、没有出路**。
+
+### 修法：整体删除，不是修修补补
+
+审批机制的设计前提是「用户会看到弹窗并回答」。**前提不成立时，它就是一个必然卡死的陷阱**，
+而卡住的代价（整个对话不能用）远大于它想防住的风险。所以彻底移除：
+
+| 位置 | 改动 |
+|---|---|
+| `ContextAgentGuard.cs` | `CheckAgentAccessAsync`（async + await 弹窗）→ **`string? CheckAgentAccess(...)` 同步方法**，立即返回 |
+| `ContextAgentGuard.cs` | 删除 `AskAgentAsync` / `AnswerAgentAsk` / `pendingAgentAsks` / `agentAskGate` / `AgentDecision` |
+| `ContextAgentGuard.cs` | 插件覆盖未启用时：**改自己、改别人都直接自动启用**（插件覆盖只在请求前重排，不写任何角色文件，关掉插件即复原） |
+| `ContextAgentApi.cs` | 8 个调用点：`await runtime.CheckAgentAccessAsync(...)` → `runtime.CheckAgentAccess(...)` |
+| `ContextManagerRuntime.cs` | 删除 `agent-answer` IPC 分支；删除 `Release()` 里的「叫醒待批审批」收尾 |
+| `app.js` | 删除 `showAgentAsk` / `answerAgentAsk` / `AGENT_RISK_NOTE` / `agent-ask` 弹窗分支（收到旧报文只记 trace） |
+| `agent-ops-tests` | 10.4~10.20、12.1~12.9 全部**反过来钉**「不存在任何等用户输入的通道」；14.4 钉「后端不再分派 agent-answer」 |
+| `smoke-test.cjs` | 新增「前端无审批弹窗」源码断言 |
+| `mutate-x.py` | 新增变异 `approval`（把准入退回 await 弹窗）→ 被抓 |
+
+### 保留 vs 删除
+
+**保留**：配置页两个开关（允许改自己 / 允许改别人）—— 那是用户对信任的一次性表达，同步生效。
+**保留**：世界书弹窗（`card-worldbook-ask`）—— 那个弹窗**是真的会出现的**，且它的 `await`
+有真实出口，不属于这类陷阱。
+**删除**：所有「弹窗出现才安全」的准入路径。
+
+### 验证矩阵（全绿）
+
+- 编译校验：通过，20 个 `.cs`，290816 字节（比上轮少 7168 —— 删掉的就是审批机制）。
+- `agent-ops-tests`：**392 项全过**。
+- 冒烟测试：**48 项全过**（新增「审批弹窗已删除」）。
+- 文档渲染：**8 项全过**。
+- 变异 `approval`（准入退回 await 弹窗）→ **被抓**：
+  `FAIL: 10.4 不存在「等用户回答」的准入通道（它会导致工具调用永久挂住）`。
+- 审计：`Alife.Function.Language.OpenAI.dll` 非本插件产出；我方只写 `Marisa.ContextManager` 自己的文件。
+
+> **铁律：任何「await 用户输入」的准入机制，只要「弹窗真的会出现」这个前提不成立，
+> 就等价于一个必然卡死的陷阱。**
+> 「有轮询」不等于「有出路」—— 轮询的 `break` 条件如果依赖另一个**同样可能不发生**的事件
+> （窗口关闭），那它只是把「永久挂住」包装得好看了一点。
+> **准入判定必须同步、立即、可预测。**
+
+## 第三十二轮（斩断对 OpenAI 插件私有接口 `ContextTransform` 的强依赖）
+
+用户反馈：
+> 「[来自系统的杂项消息推送][消息来源(ContextManagerModule)]应用失败：当前语言模型没有
+> ContextTransform 接口，请先重载已更新的 OpenAI 语言模型插件。」
+> 「**不是你该改什么 OpenAI 语言模型插件啊，如果强依附别人的插件，很麻烦的**」
+> 「我再修改让 AI 修改第三方角色的预设给的提示词」
+> 「这样子，我先回退一下 OpenAI 语言插件」
+> 「好了，**你现在完全只在插件里操作**」
+
+### 根因：`ContextTransform` 根本不是官方 API，是别人给 OpenAI 插件加的私有口子
+
+查证（全部实证）：
+
+1. **官方源码全库搜 `ContextTransform` 零命中**（`Alife-master`）。
+2. 官方 `ILanguageModel`（`Alife.Framework/Models/ILanguageModel.cs`）**只有**
+   `ChatStreamingAsync(...)` 一个方法，**没有任何请求前钩子**。
+3. 那个属性是**别人**给 OpenAI 插件源码硬加的（本仓库里 `edit.py` / `permanent-fix.py`
+   就是当年改它的遗迹）。插件用它做「请求前重排」，等于**强依附一个不受官方保证的私有口子**：
+   对方一升级/回退/换模型，整条链路当场死掉，而且报错还会把责任推给用户（「请重载插件」）。
+
+用户当场质疑得对：**插件不该去改别的插件，也不该依赖别人插件里的私有接口。**
+
+### 修法：改用官方公开挂载点 `ChatBot.ChatSent`（零第三方依赖）
+
+`ChatBot.ChatAsync` 的时序（`Alife.Framework/Models/ChatBot.cs`）：
+
+```
+127  EditChatHistoryAsync(装载用户消息)      ← 用户消息已进历史
+136  ChatSent?.Invoke(message.Content)        ← 我们在这里重排
+149  EditChatHistoryAsync(发真请求)           ← 语言模型读到的是重排后的历史
+```
+
+- **`ChatSent` 是公开事件**（`ChatBot.cs:36` `public event Action<string>? ChatSent`）——
+  官方 API，任何语言模型都有，不存在「接口缺失」。
+- **不死锁**：`ChatSent` 触发时第 127 行那次 `EditChatHistoryAsync` 已释放
+  `chatHistorySemaphore`，所以回调里同步调 `ChatBot.EditChatHistory(...)`
+  （`ChatBot.cs:75`，public 同步方法）是安全的。
+- **粒度**：`bot.ChatHistory` 是对外**快照**（`IReadOnlyList<ChatMessageContent>`，第 54 行），
+  而 `ContextCompiler.Compile` 要 `ChatHistory` —— 先按序拷一份喂编译，
+  再在 `EditChatHistory` 里「整体替换」（`Clear()` 后按编译结果重填）。
+
+### 改动清单（全部在 `Marisa.ContextManager` 插件内）
+
+| 位置 | 改动 |
+|---|---|
+| `ContextAssemblyRuntime.cs` 字段 | `Dictionary<object, Func<ChatHistory,ChatHistory>> transforms` → `Dictionary<ChatBot, Action<string>> chatSentSubscriptions`（+ `chatSentGate` 独立锁） |
+| `AttachTransform` | 反射写 `LanguageModel.ContextTransform` → `bot.ChatSent += handler`；闭包只捕获 `bot` + `owner`（字符串），不捕获 `activity` |
+| `ReorderBeforeSend`（新增） | 在 `ChatSent` 里：读计划 → 拷历史 → `ContextCompiler.Compile` → `bot.EditChatHistory` 整体替换；全程 try/catch，绝不外抛 |
+| `TryAutoAttach` | 返回 `AttachTransform(activity)`，不再看 `LanguageModel` |
+| `OnActivityDeactivated` / `DetachTransform`（新增）/ `DetachTransforms` | 摘除对象从 `LanguageModel` 换成 `ChatBot` |
+| `ApplyPlanCore` | **删掉**「挂不上就抛『没有 ContextTransform 接口』」那段；挂不上只记日志 |
+| `ContextManagerRuntime.cs` | `Release()` 注释同步；两个文件删掉不再需要的 `using System.Reflection;` |
+| `ContextCompiler.cs` | 注释里的 `ContextTransform` 改成 `ChatSent 请求前重排` |
+| `smoke-test.cjs` | 新增两条断言：**不许再反射 `ContextTransform`** / **必须 `bot.ChatSent += handler`** |
+
+### 为什么「AI 改第三方角色只改计划文件、不动角色文件」现在成立
+
+用户明确要求 AI 改别人时**不要碰对方的 `index.json`**。这就要求改完必须靠
+「请求前重排」生效，而这正是本轮把 `ContextTransform` 换成 `ChatSent` 的原因：
+官方事件 + `EditChatHistory` 是纯运行时重排，**不落任何角色文件**，关掉插件即复原。
+
+### 验证矩阵（全绿）
+
+- 编译校验：通过，20 个 `.cs`，297984 字节（与上轮一致）。
+- `agent-ops-tests`：**396 项全过**。
+- 冒烟测试：**48 项全过**（新增 2 条 ContextTransform 禁令）。
+- 文档渲染：**8 项全过**。
+- 变异 `chatsent`（把订阅退回反射 `ContextTransform`）→ **被抓**：
+  `FAIL: ContextAssemblyRuntime 不许再反射 ContextTransform`。
+- 审计：`Alife.Function.Language.OpenAI.dll` 非本插件产出（用户自行回退后由 Alife 重编译，
+  源码 9673 字节、`ContextTransform`/`ContextAssembly`/`ContextManager` 零命中）；
+  我方只写了 `Storage\Plugins\Marisa.ContextManager\*` 与 `Storage\ContextManager\*`。
+
+> **铁律：插件只能依赖官方公开 API。「别人插件里的私有口子」看着能用，
+> 但对方一升级就断，还会把断的责任推给用户。**
+
+## 第三十一轮（「首次改别人成功，之后连给自己加模块都被拦」—— 配置被多角色互相冲掉）
+
+用户反馈：
+> 「我让第三方其他 AI 角色修改 AI 角色的，结果**只有 AI 使用首次修改其他角色指令成功了**，
+> 后面都提示：『用户没有开启「允许角色修改其他角色的上下文」，所以这次保存快照被拒绝了』；
+> 然后我让 AI 再**给自己新增调用模块，结果也被拦了**，感觉是触发什么 bug 了？**我权限本身都是开着的啊**」
+
+### 根因：全局单例上放了一份「每个角色各不相同」的配置
+
+一条链、三个事实叠出来：
+
+1. **配置是「按角色」存的**。框架 `ChatActivity` 在激活模块时，
+   按 `character.StorageKey` 逐个注入 `Configuration`（源码 `Alife.Framework/Models/ChatActivity.cs:80-83`，
+   注入发生在 `AwakeAsync` 之前）。落盘位置：
+   `Storage/Character/<角色>/Configuration/Marisa.ContextManager.ContextManagerModule.json`。
+2. **本项目有 5 个角色装了本插件**：`momo`（配置文件里两个开关都是 `true`）、
+   `伊卡洛斯 / 小梦 / 星野雨 / 酒狐`（**没有配置文件** → 框架 `Activator.CreateInstance`
+   造一个默认实例 → 两个开关都是 `false`）。
+3. **`ContextManagerRuntime` 是全局单例**（`GetOrCreate` 里 `current ??= new ...`），
+   而 `Config` 只是这个单例上的**一个**属性。老实现里 `ContextManagerModule.OnUpdate()`
+   **每帧**都调 `Runtime.ApplyConfig(Configuration)` —— 把**本角色**的配置写进这个共享槽位。
+
+**合起来**：`Config` 的值 = 「最后一个跑 `OnUpdate` 的角色的设置」。
+momo 开了权限、改别人第一次成功；此后只要 momo 之外的任一角色也在跑，
+`Config` 就被冲成全 `false` —— momo 的权限被**无声撤销**。
+这**完整解释了两个现象**：
+
+- **「首次成功、之后全拒」**：第一次时 `Config` 恰好还是 momo 的（true, true）；
+  之后被别的角色覆盖成（false, false）。
+- **「连给自己加模块也被拦」**：整份 `Config` 被冲成 false，`AllowModifySelf` 也变 false，
+  于是给自己加模块同样被那条最外层的开关判断挡下（并且因为 `IsSelf` 为 false 之外的分支也走不同文案，
+  用户看到的是「其他角色」那段话 —— 正是他贴的原话）。
+
+### 修法：把「一个共享槽位」换成「按 owner 查」（不动任何既有语义）
+
+`ContextManagerRuntime.cs`：
+
+```csharp
+readonly Dictionary<string, ContextManagerConfig> ownerConfigs = new(StringComparer.OrdinalIgnoreCase);
+readonly object ownerConfigGate = new();   // 独立锁：它每帧都写，且不参与任何 IPC 构建
+
+public void  SetOwnerConfig(string? owner, ContextManagerConfig? c) { ... ownerConfigs[owner] = c; Config = c; }
+public ContextManagerConfig ConfigFor(string? owner)               { ... 命中 owner 的就用它，否则回退兜底 Config }
+```
+
+- **独立锁**（不与 `stateLock` 共用）：配置字典每帧都会写，且不参与任何 IPC 报文构建，
+  共用锁只会在「锁内构建快照」时互相蹭，没有任何好处。
+- `Config` 保留为**兜底值**（owner 名对不上时仍有可用默认），`ApplyConfig` 保留作兼容，但已无调用方。
+
+三个读取点全部改掉：
+
+| 位置 | 老写法 | 新写法 |
+|---|---|---|
+| `ContextAgentGuard.CheckAgentAccessAsync`（准入闸门） | `Config.AllowModifySelf` / `Config.AllowModifyOthers` | `ConfigFor(request.SelfOwner)` —— **必须是「发起者自己」的配置** |
+| `ContextAgentApi.BuildPrompt`（能力说明注入） | `runtime.Config.AllowModify*` | `runtime.ConfigFor(character.Name)` —— 否则「AI 忽而知道自己能改、忽而又不知道」 |
+| `ContextManagerModule.OnAwake` / `OnUpdate` | `Runtime.ApplyConfig(Configuration)` | `Runtime.SetOwnerConfig(SafeName(), Configuration)` |
+
+> `SafeName()`（= `Character.Name`）与框架注入配置用的 `character.StorageKey` 尾部段一致
+> （`Character\momo` ↔ `momo`），所以按角色名登记能精确对上；且 `Character` 在 `OnAwake` **之前**
+> 就已由框架赋值（`ChatBehaviour.AwakeAsync` 第 37 行 vs 第 43 行），登记时拿得到真名。
+
+### 验证
+
+| 工具 | 结果 |
+|---|---|
+| `agent-ops-tests` | **All 396 passed**（新增 10c.1~10c.10 共 10 条「配置按角色隔离」源码断言） |
+| `compile-verify`（部署目录 20 .cs） | **20 .cs / 383 程序集 / 297984 字节** |
+| `smoke-test.cjs` | 48 项全 PASS |
+| `agent-doc-render` | PASS |
+| `audit.py` | 硬约束 DLL sha256 未变 |
+| 变异 `cfgshare`（把 `ConfigFor(SelfOwner)` 退回 `Config`） | **抓住** → `FAIL: 10c.5 准入判定按发起者自己的配置` |
+
+### 本轮的坑与教训
+
+1. **全局单例上不要放「每个实例各不相同」的可变状态。** 配置天然是 per-owner 的；
+   把它摊到共享单例上，就等于让所有角色共用一个开关 —— 而且这种错误**不会立刻报错**，
+   只在「恰好有另一个实例在跑」时才发作，表现为**间歇性、看起来像玄学**的权限失效。
+2. **「首次成功、之后失败」是「共享状态被覆盖」的经典指纹。** 见到这个形状，
+   第一反应就该去找「有没有一处共享槽位被别的实例按帧/按事件重写」。
+3. **断言分层**：`ContextAgentGuard` / `ContextAgentApi` / `ContextManagerModule` / `ContextManagerRuntime`
+   都不在 `agent-ops-tests` 的编译范围（它们依赖 Alife 框架）。所以本轮的修复用
+   **源码级静态断言**（`ReadFile("...").Contains/Regex`）锁定 —— 这也是 `RefreshRegression`
+   已经用过的套路：**测不到行为，就测「不该出现的老写法」与「必须出现的新写法」**。
+
+当前版本：`2026-10-01ae`
+
+## 第三十轮（AI 改了上下文，界面为什么不刷新？—— 补上缺掉的通知链）
+
+用户反馈：
+> 「AI 可以新增/修改的上下文模块我在管理界面里没有**实时刷新显示**，且那个**新增模块根本没有显示**，
+> 但我在**预览界面确实能看见**那个模块确实存在」
+
+一句话结论：**模块真的写进去了，但没有任何人告诉界面这件事。**
+而且新增模块的来源是 `agent`，它**不在前端的来源白名单里** —— 所以哪怕计划推过来了也画不出卡片。
+
+### 证据（先查现场，不猜）
+
+`Plans/momo.json` 里确实躺着 AI 加的模块，说明写盘成功：
+
+```
+ 4 | agent      | en=True  | system | len=29    | '测试模块A'
+ 5 | agent      | en=True  | system | len=20    | '测试模块B'
+   UpdatedAt = 2026-10-01 20:47:33
+```
+
+那为什么界面看不到？两条独立的原因，**叠在一起**：
+
+### 1. 【真实缺陷】写计划的层发不出通知（5 条写路径全部漏了）
+
+- `ContextAgentOps` 是**纯逻辑层**（类注释原话：「不碰 IPC」），构造里只有 `planService`。
+  它改完计划只 `SavePlan`，**拿不到 runtime、发不出 IPC**。
+- `ContextAgentApi` 的写函数（`AddModule` / `UpdateModule` / `DeleteModule` / `ImportModules` /
+  `LoadPreset`）**共 5 条写路径，全部只落盘、零通知**。
+- 界面这一侧（`plan-state` / `state`）只在「用户自己保存 / 应用 / 历史被编辑」时推送。
+
+⇒ 角色改完，磁盘变了，用户盯着的窗口**纹丝不动**，必须关掉重开才看得到。
+
+### 2. 【真实缺陷】`agent` 不在前端来源白名单里
+
+两个装配布局函数都拿 `planSources` 当**来源白名单**：
+
+```js
+const sources = assemblyFilter.source === 'all' ? planSources : planSources.filter(…)
+const list = all.filter(m => (m.source || 'custom') === src);
+```
+
+而 `planSources` 里**没有 `agent`** ⇒ AI 新增的模块**任何布局下都不画**。
+偏偏「预览」是后端 `ContextCompiler.Compile` 直接渲染的、**不走这份白名单** ——
+这就精确对上了用户的描述：**预览有、界面没有**。
+
+### 修法
+
+**后端**（通知链）：
+1. `ContextAgentOps` 新增第 5 个构造参数 `Action<string, ContextPlan>? onPlanChanged`，**由 Runtime 注入**；
+   新增唯一落盘出口 `SaveAndNotify`：**先存盘、再通知**，通知抛异常只记日志。5 条写路径全部改走它。
+2. `ContextManagerRuntime` 新增 `NotifyPlanChangedFromAgent(owner, plan)`：读计划 → `SendPlanUpdated` → `QueueInitialState`。
+3. `ContextAssemblyRuntime` 新增 `SendPlanUpdated`：报文类型用 **`plan-updated`**，复用同一套 `ShrinkPlanForWire` 瘦身。
+
+**前端**（能看见）：
+4. `planSources` **补上 `["agent","AI 新增"]`** —— 这条单独就能让新模块显示出来。
+5. 新增 `plan-updated` 分支：没在编辑就直接换上新计划；**正在编辑就保留草稿**，
+   弹一条 `#externalPlanNotice` 提示条（「载入最新」/「保留我的」），
+   并**作废旧的已读全文缓存**（AI 可能改写了正文）。
+6. `readPlanFields` **改为「确实变了才置脏」**，且正文比对**先规范化换行**。
+   原实现第一行就 `planDirty = true`，后果不只是多脏一次：用户点一下模块**看一眼**（什么都没改）
+   就把自己标成「有未保存修改」，于是 AI 推来的更新只能变成提示条 —— 看到的还是「没同步」。
+   另外 `<textarea>` 会把 `\r\n` 规范化成 `\n`，不规范化换行的话，一条含 CRLF 的正文**一打开就被判成改过了**。
+
+### 三条约定（被 `agent-ops-tests/RefreshRegression.cs` 逐条锁定）
+
+1. **必须在落盘之后调** —— 通知方要读新计划，先通知会读到旧内容；
+2. **只在真正改动了才调** —— 读操作（outline / read / preview）与失败的写一律不调；
+3. **通知失败绝不能影响那次写操作的结果** —— 计划已经落盘了，那是真东西；
+   用户在没开窗口时操作，通知里会拿不到窗口，不能因此把「已保存」报成失败。
+
+### 变异测试
+
+`tmp/mutate-x.py` 新增两个模式，都验证过**能抓住**：
+- `notify`：把 `SaveAndNotify` 退回「只存盘不通知」→ `FAIL: refresh: AI add notifies with agent source`；
+- `agent`：把 `agent` 从白名单删掉 → 冒烟 `FAIL: agent source must be visible`。
+
+### 本轮踩到的坑
+
+- ⚠️ **`restore` 会用旧备份静默抹掉新修复**。跑变异前**必须先把 `tmp/*.PRISTINE.*` 刷新一遍**，
+  否则第一次 `restore()` 就把本轮改动全部回滚。
+- ⚠️ **`dotnet run --no-incremental` 之外还要清 `obj/` `bin/`**：有一次断言假失败，
+  清掉缓存才恢复正常。
+- ⚠️ `smoke-test.cjs` 的 strict-mode：`#externalPlanNotice button` 期望唯一匹配，
+  所以提示条里**只能有一个 `<button>`**（「保留我的」做成链接样式）。
+
+### 验证矩阵
+
+| 验证 | 结果 |
+|---|---|
+| 编译校验（Alife 自己的 Roslyn） | 20 个 .cs / 383 程序集 / 297472 字节 |
+| 源码级断言 | **All 386 passed** |
+| 函数文档渲染 | 8 PASS / 0 FAIL |
+| 前端冒烟 | 48 项 PASS |
+| 零污染审计 | 硬约束 DLL sha256 未变 |
+| 变异测试 | `notify` ✅ 抓住 / `agent` ✅ 抓住 |
+
+构建号：`cm-app-2026-10-01-ad` → **`cm-app-2026-10-01-ae`**（四处同步：
+`ContextManagerRuntime.AppBuild` / `app.js` 的 `APP_BUILD` / `index.html` 的两处 `?v=` / `smoke-test.cjs` 的 `BUILD`）。
+
+---
 
 ## 第十七轮（长时间运行审计：内存 / 显存 / 插件覆盖长跑）
 
@@ -222,7 +552,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 ### 1. 右栏「模块搜索」：143 个模块不用再肉眼滚
 
-第十二轮修好「导入后装配页一片空白」之后，`某张卡.png` 那种卡导入进来就是 **143 个模块**。
+第十二轮修好「导入后装配页一片空白」之后，`【Sgw】又看一集.png` 那种卡导入进来就是 **143 个模块**。
 中间列一屏放不下几个，右栏没选中模块时又只有一句「单击模块在这里修改」——
 想找某一条世界书条目只能靠肉眼滚，等于没有导航。
 
@@ -290,7 +620,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 ### 4. 编辑大窗口的「⤢ 放大」
 
-长正文（`某张卡.png` 那种单条 3 万字的开场白）在大窗口里编辑时，
+长正文（`Sgw_2.png` 那种单条 3 万字的开场白）在大窗口里编辑时，
 「模块名称 / 输出身份 / 区域 / 区域内顺序」四个字段只是占地方。
 现在内容区块旁多了一个「⤢ 放大」按钮：点一下把内容编辑器顶到整个弹窗、
 隐藏前面所有字段（`.modal-body.editor-expanded`），按钮变成「⤡ 还原」，再点一次回去。
@@ -316,9 +646,9 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 用户报的两个问题（逐字）：
 
-> 某张卡.png导入后显示导入完成，但有字段被跳过
+> E:\Download\Chat-WenDa\AA酒馆AA\【Sgw】又看一集.png导入后显示导入完成，但有字段被跳过
 > ×
-> 卡内世界书已一并导入 142 条。 这张卡没有填写标准的提示词字段（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令），已按「基本信息」导入：只用上了开场白 / 作者注释等能读到的内容，之后可再补设定或导入世界书。；但结果什么也没有；；还有一个导入后显示：一条「worldbook-state」数据有 864 KB（转义后），超过安全上限 576 KB，已阻止发送以免把 IPC 桥卡死。请减少该角色参与装配的上下文条目后重试；某张卡.png
+> 卡内世界书已一并导入 142 条。 这张卡没有填写标准的提示词字段（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令），已按「基本信息」导入：只用上了开场白 / 作者注释等能读到的内容，之后可再补设定或导入世界书。；但结果什么也没有；；还有一个导入后显示：一条「worldbook-state」数据有 864 KB（转义后），超过安全上限 576 KB，已阻止发送以免把 IPC 桥卡死。请减少该角色参与装配的上下文条目后重试；E:\Download\Chat-WenDa\AA酒馆AA\Sgw_2.png
 
 两件事的根因是同一个：**`plan-state` 和 `worldbook-state` 没有走预算装填。**
 
@@ -327,8 +657,8 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 | 角色卡 | 世界书条数 | 正文 | 卡 JSON |
 | --- | --- | --- | --- |
-| `某张卡 A.png` | 142 | 98,837 字（计划 143 个模块） | 566,977 字符 |
-| `某张卡 B.png` | 40 | 77,648 字 | 925,063 字符 |
+| `【Sgw】又看一集.png` | 142 | 98,837 字（计划 143 个模块） | 566,977 字符 |
+| `Sgw_2.png` | 40 | 77,648 字 | 925,063 字符 |
 
 汉字经 `System.Text.Json` 序列化后是 6 字节（`\uXXXX`），所以 9.9 万字 ≈ 594 KB、7.8 万字 ≈ 466 KB。
 再加上模块元数据，`plan-state` 会到 610 KB、`worldbook-state` 会到 864 KB —— 全部超过
@@ -425,7 +755,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 用户报的崩溃（逐字）与两条新需求：
 
-> 导入装配资源失败
+> 导入装配资源失败 momo
 > System.ArgumentException: Accessed JArray values with invalid key value: "entries". Int32 array index expected.
 > at Newtonsoft.Json.Linq.JArray.get_Item(Object key)
 > at Marisa.ContextManager.TavernImport.EntryRows(JToken book) in ...\TavernImport.cs:line 101
@@ -437,7 +767,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 | 问题 | 现在 |
 | --- | --- |
 | **导入任何带 `character_book` 的角色卡都必崩**（`Accessed JArray values with invalid key value: "entries"`） | 根因是**双重规范化**：`MergeCardWorldBook` 先把卡内世界书 `TavernImport.NormalizeEntries(cardBook)` 变成 **JArray**，再把这个 JArray 交给 `MergeWorldBook(existing, incoming)`；而 `MergeWorldBook` 内部**又调了一次** `NormalizeEntries` → `EntryRows` 收到的是一整个 JArray，于是它按字符串键去取 `book["entries"]`，在 JArray 上抛 `System.ArgumentException`。**不是某张卡畸形，是每条路径都会炸**（全盘扫过 14,860 个文件，`character_book` 为数组的文件数为 0）。修法三层：① `MergeCardWorldBook` 改为直接把**原始** `cardBook` 传给 `MergeWorldBook`；② `MergeWorldBook` 的形参改名 `incomingEntries`，注释写明「规范化是这一层的事，调用方不要预先规范化」；③ `EntryRows` 加**形状守卫** —— 认不出形状就返回空集，绝不抛异常（导入流程不该因为一次误用或一张畸形卡炸掉整个操作）。单元测试把「规范化后的 JArray 直接喂给 `MergeWorldBook`」这个崩溃现场原样复现并锁住。 |
-| **卡内世界书用工具栏勾选框，用户没法预判**（用户：「不应该是在导入的角色卡的时候，当检测到有世界书那就再一个弹窗确认是否需要导入该卡世界书？来让用户选择吗」） | 勾选框删掉了。现在**选完文件、后端把卡读进来之后**才判断：`EntryRows(card.character_book)` 有条目就弹一个原生确认框（Electron `MessageBoxOptions`），标题写「『某角色』内嵌了 6 条世界书条目」，正文列出前 6 条**条目标题**做预览，按钮是「一起导入 / 只要角色卡」，下面带复选框「**记住我的选择（以后不再询问）**」。装配页的「角色卡」和酒馆兼容页的「导入角色卡」**共用同一套策略与记忆**（以前后者是无条件并入，用户没有拒绝的机会）。弹窗关掉（Esc / 点 ×）按「只要角色卡」处理，而不是取消整个导入 —— 用户已经选好文件了，把角色卡导进来才是本意。 |
+| **卡内世界书用工具栏勾选框，用户没法预判**（用户：「不应该是在导入的角色卡的时候，当检测到有世界书那就再一个弹窗确认是否需要导入该卡世界书？来让用户选择吗」） | 勾选框删掉了。现在**选完文件、后端把卡读进来之后**才判断：`EntryRows(card.character_book)` 有条目就弹一个原生确认框（Electron `MessageBoxOptions`），标题写「『灰风』内嵌了 6 条世界书条目」，正文列出前 6 条**条目标题**做预览，按钮是「一起导入 / 只要角色卡」，下面带复选框「**记住我的选择（以后不再询问）**」。装配页的「角色卡」和酒馆兼容页的「导入角色卡」**共用同一套策略与记忆**（以前后者是无条件并入，用户没有拒绝的机会）。弹窗关掉（Esc / 点 ×）按「只要角色卡」处理，而不是取消整个导入 —— 用户已经选好文件了，把角色卡导进来才是本意。 |
 | **策略没有落脚点，每次都要重新做决定** | 新增 `Storage/ContextManager/ImportOptions.json`，只存 `cardWorldbook: ask / always / never`（默认 `ask`）。没塞进 `ContextManagerConfig`：那是模块级配置（覆盖模式 / 预设 / 宏开关），改它会牵动配置面板的读写与迁移；这里只是一个三行 JSON 的小文件，读失败就退回默认值，不影响导入本身。策略的**可视入口放在酒馆兼容页**（「导入选项 → 卡内世界书」下拉框），选完立刻写回并刷新说明文字，随时能改回「每次询问」。 |
 | **世界书面板保存会丢掉酒馆专属字段**（顺带修） | 面板只编辑 7 个字段（标题 / 关键词 / 正文 / 启用 / 常驻 / 顺序 / ID），但 `SaveWorldBook` 是**按面板字段把整份文件重建**的 —— 从酒馆导入的世界书，第一次点保存就会丢掉 `position` / `depth` / `probability` / `secondary_keys` / `extensions` 等所有面板管不到的字段。现在改成**原地修改原始条目**（先按 ID 找，找不到再按「标题 + 正文」找；老文件没有 `id` 时面板会现生成一个 Guid，那种 id 是找不到原始行的），面板字段照常覆盖，其余字段原样保留。另有一个隐蔽的坑：`TavernImport` 读取时**酒馆键优先**（`Title` 取 `comment ?? name ?? Title`，`Enabled` 还要再 `&& !disable`），所以原地改之前必须先删掉这些「优先级更高的别名」（`StripShadowKeys`），否则用户在面板里改的标题 / 启用状态会被残留的 `comment` / `disable` 覆盖回去 —— 表现就是「改了但没生效」。保存前也会 `backup-时间戳` 了。 |
 
@@ -445,15 +775,15 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 
 用户的五条原话（逐字）：
 
-> 既然是角色快照，所以我希望把角色设定里的内容也包括酒馆的预设世界书角色卡的设定内容也存进去；；还有就是导入角色卡的时候，角色设定这一层级的显示就消失了，我点击角色卡不参与装配，然后它才会出现，后面它就能一直出现了，这显示问题；还有界面的预览保存草稿应用到当前角色这些按钮的左边的文字CONTEXT RECIPE上下文装配什么的可以换成讲解插件覆盖和本地覆盖的区别；还有有些角色卡是有世界书的，但是没有选项让导入的时候是否也导入卡里的世界书，比如:某张卡.png，还有一些角色卡无法导（当前角色的酒馆卡里没有可导入的提示词字段（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令 全为空）。）比如：某张卡.png，因为一些卡比较特殊，但可以适配基本信息就可以了
+> 既然是角色快照，所以我希望把角色设定里的内容也包括酒馆的预设世界书角色卡的设定内容也存进去；；还有就是导入角色卡的时候，角色设定这一层级的显示就消失了，我点击角色卡不参与装配，然后它才会出现，后面它就能一直出现了，这显示问题；还有界面的预览保存草稿应用到当前角色这些按钮的左边的文字CONTEXT RECIPE上下文装配什么的可以换成讲解插件覆盖和本地覆盖的区别；还有有些角色卡是有世界书的，但是没有选项让导入的时候是否也导入卡里的世界书，比如:E:\Download\Chat-WenDa\AA酒馆AA\灰风.png，还有一些角色卡无法导（当前角色的酒馆卡里没有可导入的提示词字段（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令 全为空）。）比如：E:\Download\Chat-WenDa\AA酒馆AA\Sgw_2-gemini.png，因为一些卡比较特殊，但可以适配基本信息就可以了
 
 | 问题 | 现在 |
 | --- | --- |
 | **角色快照只存「配方」不存「原料」** | 快照（`CharacterPresets/*.json`、导出的 `.contextpreset.json`）以前只有装配计划。可模块正文里大多是 `{{description}}` / `{{worldbook}}` 这类**宏**，取值来自角色目录下的 `TavernCard.json` / `WorldBook.json` 和 `ContextManager/Presets/<名>.json` —— 只带走计划，换角色/换机器后宏全部展开成空。现在新增 `sources` 字段，把**酒馆卡原文 + 世界书原文 + 酒馆预设原文及其名称**一起打包；读取/导入/计划丢失自动恢复时都会回填（**只补缺失的文件，绝不覆盖本机已有的**，覆盖前先 `backup-时间戳`）。快照卡片会显示「含设定来源：世界书 N 条 / 酒馆卡 / 预设 X」，没抓到来源的会明确写「只含装配配方」，不让用户误以为它是完整的。 |
 | **导入角色卡后「角色设定」层级忽隐忽现** | 根因是**两处逻辑互相打架**：`ImportPlanModules(kind=card)` 里有一句 `plan.Modules.RemoveAll(Source=="native")`（注释写着「Tavern mode replaces the native character block」），而 `PreparePlan` 又有一条「计划里一个 native 模块都没有就补一个官方系统消息模块」的兜底。于是导入后「角色设定」分区立刻消失（空分区不渲染），**下一次保存/应用**（比如用户随手取消一个模块的「参与装配」勾选）后端又把 native 补回来 → 用户看到的就是「点一下才出现，之后一直在」。现在**不再删除** native 模块：重复内容改由 `skippedByNative` 判重跳过（正文与「角色设定 #0」逐字相同时不重复导入），并在提示里说明。冒烟测试直接读源码断言这句 `RemoveAll` 不许再出现。 |
 | **预览/保存草稿/应用到当前角色左边的文字没讲清两种覆盖方式的区别** | 装配页头部原来只写「模块从上至下依次写入请求」，用户看不出「插件覆盖」和「本地覆盖」差在哪 —— 一个只改请求、一个改角色文件，选错的代价完全不同。现在直接在按钮左边讲清楚：**插件覆盖**不动角色文件、只在请求前重排、随时关掉就恢复；**本地覆盖**写进 `index.json` 的 `Prompt`、插件关掉也生效、但每改一次都要重新「应用到当前角色」。 |
-| **卡内世界书没有导入选项**（例：`某张卡.png` 带 6 条 `character_book.entries`） | 导入栏新增「**带卡内世界书**」勾选项（默认开，选择记住）。勾选时一次操作做完两件事：① 把 `data.character_book` **合并**进角色目录的 `WorldBook.json`（判重按「标题 + 正文」，用户已有的条目一律保留，导入是「加上去」不是「换掉」）；② 把条目作为 `source=worldbook` 的模块加进装配。顺带修掉一个老 bug：以前把酒馆世界书**原文**直接写进 `WorldBook.json`，而世界书面板读的是大写 `Entries`，酒馆用小写 `entries` → 「导入成功但面板里一条都没有」。现在统一走 `TavernImport.NormalizeEntries` 规范化后再落盘，读盘也走同一条路径。 |
-| **「特殊卡」提示词字段全空就直接拒绝导入**（例：`某张卡.png`） | 实测两张被抱怨的卡**并不是真的什么都没有**：`某张卡.png` 的 `description` 有 252 字；`某张卡.png` 的 6 个标准字段全空，但 `first_mes` 有 **32,051 字**、还带 40 条卡内世界书。旧逻辑只认那 6 个字段，全空就抛「没有可导入的提示词字段」。现在可用字段扩到 8 个（6 个标准字段 + **开场白** + **作者注释**），全空时才报「没有任何可用文本」，并且会在提示里说明「已按基本信息导入」。创建角色入口（酒馆兼容页）也同步：6 个标准字段全空时退回用开场白/作者注释拼 `Prompt`，世界书改为「合并卡内世界书 + 补一条开场白」，不再覆盖写。 |
+| **卡内世界书没有导入选项**（例：`灰风.png` 带 6 条 `character_book.entries`） | 导入栏新增「**带卡内世界书**」勾选项（默认开，选择记住）。勾选时一次操作做完两件事：① 把 `data.character_book` **合并**进角色目录的 `WorldBook.json`（判重按「标题 + 正文」，用户已有的条目一律保留，导入是「加上去」不是「换掉」）；② 把条目作为 `source=worldbook` 的模块加进装配。顺带修掉一个老 bug：以前把酒馆世界书**原文**直接写进 `WorldBook.json`，而世界书面板读的是大写 `Entries`，酒馆用小写 `entries` → 「导入成功但面板里一条都没有」。现在统一走 `TavernImport.NormalizeEntries` 规范化后再落盘，读盘也走同一条路径。 |
+| **「特殊卡」提示词字段全空就直接拒绝导入**（例：`Sgw_2-gemini.png`） | 实测两张被抱怨的卡**并不是真的什么都没有**：`灰风.png` 的 `description` 有 252 字；`Sgw_2-gemini.png` 的 6 个标准字段全空，但 `first_mes` 有 **32,051 字**、还带 40 条卡内世界书。旧逻辑只认那 6 个字段，全空就抛「没有可导入的提示词字段」。现在可用字段扩到 8 个（6 个标准字段 + **开场白** + **作者注释**），全空时才报「没有任何可用文本」，并且会在提示里说明「已按基本信息导入」。创建角色入口（酒馆兼容页）也同步：6 个标准字段全空时退回用开场白/作者注释拼 `Prompt`，世界书改为「合并卡内世界书 + 补一条开场白」，不再覆盖写。 |
 
 ## 第八轮（按预算装填 + 分页加载；并修掉出站合并吃掉回包导致的 15 秒超时）
 
@@ -474,7 +804,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 | **`character-bundle` 涨到 635 KB 被硬上限拦掉，界面报"体积过大"**（用户："各种报错 ipc 什么体积过大什么的"） | 找到真正的肥元凶：`ExtractAttachments` 把**整条消息正文**又复制一份塞进 `Attachments[].Detail`。后果有两层：正文在报文里出现两次（bundle 涨到 635 KB），而且降级阶梯只清 `Content`、不动 `Attachments` —— **降级是假的**（声称"正文全部改为按需读取"之后报文仍有 317 KB）。现在 `TextContent` 只放短预览，且 `TruncateItems` / `CloneWithoutContent` 一并清附件 `Detail`。bundle 本身也走 `FillToBudget`。 |
 | **只按时间排序会把"小但关键"的条目挤出去** | 新增装填分档 `ContextStateBudget.FillTier`：`character-prompt` / `offline-system` / `live-system` / `global-config` 为第 0 档，永远先进报文；其余第 1 档。否则"三个月没改角色设定"就会让角色 Prompt 被最新几条聊天挤出报文，**提示词工作室和角色管理页直接空白** —— 这比消息分页严重得多。 |
 | **分页 offset 与后端切页口径不一致会漏条** | `state` 装填、`character-bundle`、`items:page` 三处**共用同一个** `ContextStateBudget.OrderForFill`（当前查看角色优先 → 配置类优先 → 更新时间倒序）。后端回传 `nextOffset`，前端原样传回；剩余条数 `remaining` 也由后端算（前端自己数会被去重影响而算错）。单元测试锁住"两页拼起来 == 全集且不重不漏"。 |
-| **分页条显示的欠账是全局合计，不是当前角色的** | `state` 新增 `omittedByOwner`（按角色拆开），分页条说的是「"某角色"共 250 条，还有 155 条更早的条目未加载」，不会把别的角色的欠账算到当前角色头上。 |
+| **分页条显示的欠账是全局合计，不是当前角色的** | `state` 新增 `omittedByOwner`（按角色拆开），分页条说的是「"星野雨"共 250 条，还有 155 条更早的条目未加载」，不会把别的角色的欠账算到当前角色头上。 |
 | **`character-prompt` 条目其实从来没进过 `state`** | 上一轮把 `BuildOwnerItems` 抽出来时漏掉了 `AddEditableCharacterPrompt`，于是 `sourceKey === "character-prompt"` 的条目根本不存在 —— 提示词工作室的文本框、角色管理页的角色摘要、装配页的「角色卡独立系统提示词」分组全都读不到数据。现在补回，并且它是第 0 档、体积小，不会被分页挤出去。 |
 | **降级/分页必须"看得见"** | `state.degradeSteps` + `hiddenItems` 走页面头的降级提示条；`omittedByOwner` 走对话页 / 记忆页 / 附件页底部的分页条；总览页列出每个角色还有多少条没加载，点角色名直接跳到该角色的对话页继续读。**所有会渲染条目的视图都有分页入口，不会出现"点了没反应"的死按钮。** |
 
@@ -486,7 +816,7 @@ Electron 里 `-webkit-app-region: drag` 是**窗口级**命中测试：标题栏
 | 报文体积一直没被发现，因为按**字符数**记的日志严重低估 | SocketIOClient 用 `System.Text.Json` 序列化，**所有非 ASCII 会被写成 `\uXXXX`（一个汉字 6 字节）**。所以日志改成记**真实转义后的字节数**：`-> state bytes=...`、`state push: ... bytes=N budget=M steps=[...]`。 |
 | 预算和硬上限本身也低估了近一倍（**口径不一致**） | `Measure` / `MaxWireBytes` 一开始量的是 **UTF-8 字节数**，而真正写上线的是**转义后**的字节数。后果很严重：名义 512 KB 的硬上限，实际会放行约 920 KB —— 正好贴着 1 MB 的断连线，保护形同虚设。现在统一由 `ContextStateBudget.EscapedBytes` 逐字符精确计算（`"`/`\` 2 字节、控制字符与所有非 ASCII 6 字节），预算、硬上限、计划内联阈值、限速窗口全部走同一个口径。 |
 | 条目**数量**本身就能把报文顶爆 | 每条条目光 JSON 字段名就要约 450 字节：正文全部清空后，400 条仍有 180 KB。原来的降级阶梯最后一档是"正文清零"，遇到大量条目就走到了尽头。现在加最后一档**按数量裁剪**（保留最近更新的 N 条），并把 `hiddenItems` 告诉界面，由界面说明"另有 N 条因报文体积限制没有列出"。有了这一档，「任何快照都能落进预算」这个不变量才对**任意条目数**都成立 —— 这是"插件永远不会顶断 IPC 桥"的最后一道保证（测试覆盖到 5000 条）。 |
-| **"只激活一个角色就不会出错" —— 这个规避方法不成立** | 之前没出错是因为**当时激活的是 某角色**（6 个模块，计划只有 11.5 KB）。换成**单独一个某角色**就已经约 **730 KB** 了：计划 327 KB + 提示词 78 KB + 运行时系统消息约 90 KB + 条目 235 KB。再加上防抖刷新会连着排队两条 `state`、engine.io 会把它们合并成一个请求 → 超过 1 MB → 同样卡死。**这是相关性，不是因果**；能不能出事取决于角色的计划有多大，不是激活了几个。 |
+| **"只激活一个角色就不会出错" —— 这个规避方法不成立** | 之前没出错是因为**当时激活的是 momo**（6 个模块，计划只有 11.5 KB）。换成**单独一个伊卡洛斯**就已经约 **730 KB** 了：计划 327 KB + 提示词 78 KB + 运行时系统消息约 90 KB + 条目 235 KB。再加上防抖刷新会连着排队两条 `state`、engine.io 会把它们合并成一个请求 → 超过 1 MB → 同样卡死。**这是相关性，不是因果**；能不能出事取决于角色的计划有多大，不是激活了几个。 |
 | 预算定太小会误伤用户看得见的正文（**比卡死还难受**） | 中途一版把预算设成 224 KB，真实数据（一个角色的全文上下文约 230 KB）一进来就触发截断，用户看到的就是"消息都显示不完整"。第八轮把预算提到 **448 KB** 并改成按预算装填 + 分页（见上）。**正文只在真正装不下时才被截。** |
 | 「实时上下文」列表号称只给短预览，其实一直在推全文 | 一个**写进去但没人读**的死配置：`AddLiveContextSummary` 把 `Config.MaxPreviewChars` 设成 220，但全项目没有任何地方读它，真正取内容的是 `Limit()`，而它无条件返回全文。现在改成显式传参，并给条目打 `truncated` 标记（`MaxPreviewChars` 已标 `[Obsolete]`）。 |
 | 截断后的预览有可能被当成正文写回，丢用户数据 | 后端 `ReadFullContent` 的最后兜底**不再返回预览**（宁可抛异常）；前端任何保存路径都先过一道闸：没取过全文就先 `item:load` 再让用户保存。 |
@@ -647,7 +977,7 @@ OpenAI 侧的 ContextAssembly/ContextCompiler.cs、ContextPlanModels.cs 是同�
   - 该角色根本没有 `TavernCard.json` → 提示先用「角色卡」按钮导入一张 JSON/PNG 卡。
   - 卡字段**已被预设中的 `{{description}}`/`{{personality}}` 等宏覆盖** → 这时会明确告诉你「无需重复导入」，并说明你在预览里看到的角色卡内容正是这些宏展开的结果；有部分字段被跳过时会弹窗列出是哪几个。
   - 卡字段**与「角色设定 #0」的内容逐字相同** → 同样说明「已包含在发送内容里」，并告诉你想单独编辑就先取消勾选「角色设定」分区里的模块。**不会**再为了「避免重复」而静默删掉「角色设定」分区。
-- **「特殊卡」只适配基本信息**：可用字段是 8 个 —— 酒馆标准的 6 个（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令）加上**开场白**（含 `alternate_greetings` 里的额外开场）和**作者注释**。实测有些卡 6 个标准字段全空、整段设定都放在开场白里（`某张卡.png` 的 `first_mes` 有 32,051 字），这种卡以前会被直接拒绝导入。现在只要有任意一个字段有内容就会导入，并在提示里说明「已按基本信息导入」；只有 8 个字段全空且卡内没有世界书时才报「没有任何可用文本」。
+- **「特殊卡」只适配基本信息**：可用字段是 8 个 —— 酒馆标准的 6 个（描述 / 性格 / 场景 / 系统指令 / 对话示例 / 历史后指令）加上**开场白**（含 `alternate_greetings` 里的额外开场）和**作者注释**。实测有些卡 6 个标准字段全空、整段设定都放在开场白里（`Sgw_2-gemini.png` 的 `first_mes` 有 32,051 字），这种卡以前会被直接拒绝导入。现在只要有任意一个字段有内容就会导入，并在提示里说明「已按基本信息导入」；只有 8 个字段全空且卡内没有世界书时才报「没有任何可用文本」。
 - **卡内世界书**：不再用工具栏勾选框（用户没法预判某张卡里有没有世界书）。现在**读到卡、检测到 `character_book` 有条目就弹窗询问**，弹窗列出前几条条目标题做预览，按钮「一起导入 / 只要角色卡」，并带「记住我的选择」复选框。选择「一起导入」时会把 `data.character_book` 合并进角色目录的 `WorldBook.json` 并作为 `source=worldbook` 的模块加进装配。**判重按「标题 + 正文」**，用户自己加过的条目一律保留（导入是「加上去」，不是「换掉」）；合并前先落一份 `.backup-<时间戳>`。长期策略（`ask` / `always` / `never`）存在 `Storage/ContextManager/ImportOptions.json`，可视入口在**酒馆兼容页 → 导入选项**，随时能改回「每次询问」。装配页「角色卡」与酒馆兼容页「导入角色卡」共用同一套策略。
 - **世界书形状统一**：酒馆用 `entries`（可以是对象）+ `comment/keys/secondary_keys/insertion_order/disable`，本插件的世界书面板读 `Entries`（数组）+ `Title/Keywords/InsertionOrder/Enabled`。以前把酒馆原文直接写进 `WorldBook.json`，面板读不到小写 `entries` → 「导入成功但一条都没有」。现在落盘前统一走 `TavernImport.NormalizeEntries`，读盘也走同一条路径（`GetWorldBook` 也改成规范化读取），两种来源都能正确显示。
 
@@ -658,7 +988,7 @@ OpenAI 侧的 ContextAssembly/ContextCompiler.cs、ContextPlanModels.cs 是同�
 - 管理器编译通过（0 错误；仅环境/平台警告）。
 - 编译器 + 装配测试（`../context-manager-tests`，**298 项**）：第一条真实身份、插入顺序、禁用、记忆边界、关键词触发、模板、注释宏删除、未识别宏按原文保留并回报、预设顺序、保存读取、关闭模式；实际 OpenAI `BuildRequest` 的离线请求体（user/assistant、原历史不变，不发网络请求）；原生模块过期时降级为原文 + warning（不再抛错）；官方系统消息构造 / 本地覆盖剥离外壳 / 旧计划升级为官方全文 / 新建计划带官方全文 / 插件覆盖只换 index[0] 且其余消息顺序内容不变 / 角色预设 camelCase 往返；落盘缩进 vs 上线紧凑（并验证往返等价）/ 导入改写 owner / 名字等于角色名时避开自动快照槽 / 空名字回退 / 无 plan 与 0 模块必须报错 / 导出文件名 / 导出→导入完整往返（mode、userName、customMacros、keywords、targetIndex、originalContent、全文都不丢）；转义字节口径（ASCII 1 字节 / 汉字 6 字节 / `"` `\` 2 字节 / `\n` `\t` 短转义 / 其它控制字符 `\uXXXX` / `<&>` 也转义 / 代理对 12 字节 / 空串与 null 都是 2 字节）/ `Measure` 按转义字节而不是 UTF-8 / 预算内不降级 / 超预算先丢计划再丢提示词最后才截断正文 / 降级后必须真的落进预算 / 截断条目必须打 `truncated` 标记 / 小计划不因条目大而被白丢 / 400 条也能落进预算 / 3000 条按数量裁剪后落进预算且 `hiddenItems` 与实际相符 / 1·50·500·2000·5000 条都不超过预算且远低于硬上限 / 降级说明是人话；**第八轮新增：`FillToBudget` 装得下就给全文（一个字都不截）/ 装不下就只给元数据并打 `Truncated` / `kept + omitted` 恒等于输入条数（不静默丢条）/ 保持调用方的优先级顺序 / 实测结果真的落进预算（并断言「快照外壳」必须当作 reserve 传进去）/ 元数据档必须同时清掉 `Content` 和 `Attachments[].Detail`（否则降级是假的）/ 预算为 0 或负数时退回默认而不是什么都不装 / 保留量吃掉整个预算时全部延后而不抛异常 / 任意条数 × 任意预算下都落进预算；`FillTier` 让角色 Prompt（哪怕三个月前写的）排在最新聊天之前 / 同角色内部顺序与「当前查看谁」无关 / 分页两页拼起来 == 全集且不重不漏；**第九轮新增：角色卡可用字段清单（6 个标准字段 + 开场白 + 作者注释，且宏名互不重复）/ 世界书规范化（酒馆 `entries`(对象) + `comment/keys/secondary_keys/insertion_order/disable` → 本插件 `Entries`(数组) + `Title/Keywords/InsertionOrder/Enabled`，已有 `id` 必须保留、二次规范化必须幂等、`World()` 读规范化前后条目数一致）/ 合并卡内世界书（判重按「标题+正文」、用户已有条目原样保留且排在最前、新增追加在末尾、重复导入不再新增、空正文不写入、卡内无世界书时不动用户的 `WorldBook.json`）/ 快照 `sources` 落盘往返逐字不变（世界书条数、酒馆卡 `first_mes`、预设名与原文）/ 空 `sources` 判为空（不给每个快照塞空壳）/ 换主人时 `sources` 必须跟着走（漏掉就只剩配方，`{{worldbook}}` 展开成空）/ 第八轮之前导出的旧快照（无 `sources`）仍可导入**；**第十一轮新增：`EntryRows` 的形状守卫（收到已规范化的 JArray 必须认出而不是抛异常；认不出的形状返回空集；`null` 返回空集）/ `NormalizeEntries` 幂等（跑两遍条目数不变、已有 `Id` 必须保留、标题与正文不变）/ 崩溃现场复现（把规范化后的 JArray 直接喂给 `MergeWorldBook` 必须新增 2 条而不是抛 `ArgumentException`；同一份 JArray 再合并一次全部判重跳过；传原始酒馆书与传 JArray 的合并结果一致）/ `WorldBookFile` 也能吃 JArray / `EntryTitles`（弹窗预览用）读标题、遵守 `max` 上限、`null` 与无标题条目返回空**；**第十四轮新增：`MinKeepChars == 2000` / 复现现场（20 个 3 万字巨块 + 末尾一条 244 字）—— 那条 244 字**一个字都不截**、不被标 `truncated`，21 个模块一个不少且整份落进预算 / 被截的模块**只有一种长度**（水填平）且不低于 2000 / 30 条 2000 字正文在 200 万字巨块面前也全留、只砍巨块 / `FitText(244 汉字, 1000)` 返回**最长前缀**（166 字，旧档位只有 80）而不是往档位上凑 / 世界书面板里排在 10 条 4 万字长条目之后的 244 字条目同样不被截、只有 10 条长条目被截 / state 条目在 8 档预算（40K…8K）下 244 字都保留全文**；**第十五轮新增（16 条，门槛 vs 预算）：总量在预算内时门槛 0/2000/10000/20000/100000 都不截任何正文（门槛与「能否全显示」无关）/ 门槛 2000 时 1500 字短正文完整保留、门槛 10000 时**一条都保不住**（提高门槛反而更容易截到短正文）/ 产品门槛仍等于 2000 且必须让「保护短正文」档真的生效 / 总量超预算时门槛怎么调都压到同一个上限 / 448 KB ≈ 76,458 汉字、576 KB ≈ 98,304 汉字 / 预算 < 自设硬上限 < engine.io 的 1 MB 断连线（次序不能乱）**。
 - 浏览器模拟 IPC 测试（`smoke-test.cjs`，Playwright + 桩 IPC，**44 组**：编号 1–28 及 28b/28e–28l 等子组）：通道取自窗口 URL、trace 落盘、模块卡片内容、插件覆盖下的预览取计划内容（原来的 bug）、填入官方模板、模式名、自动侧装提示、按来源分区、「酒馆预设」改名、区域/来源筛选、视图切换、按区域删除未勾选 / 重置为空白（含 state 推送后仍保持空白）/ 按来源清空、宏设置保存、导入被跳过字段的提示、预览的未识别宏与降级提示、角色预设页与弹窗的读取/生效/删除/保存、角色预设导出/导入入口、标题栏整条 drag 区域、长期记忆的分层说明与逐行编辑按钮、截断条目的保存拦截（必须先 `item:load`，不能把预览写回）/ 报文降级提示条（有降级才显示）/ 条目按数量裁剪时说明「只列出最近 N 条 + 还有 M 条未列出」；**第八轮新增：分页条按角色显示欠账（不能用全局合计）/ 点「加载更早」真的发 `items:page` 并带上 offset / 翻页后剩余条数按后端回传的 `remaining` 递减 / 全部加载完后按钮消失（不留死按钮）/ 截断且正文为空的条目必须显示「正文未随状态推送加载 · 读取全文」而不是留白 / 点它走 `item:load`；**出站合并不变量（读 `ContextIpcBridge.cs` 的 `Coalescible` 与页面的 `requestExpectations` 交叉比对：任何「某个请求的专属回复」都不允许被合并；`worldbook-state` 显式禁止）/ 一份 `state` 必须核销所有在等 state 的请求（广播回复）/ 非广播回复仍然一对一 / state 推送后不再重发 `character:load`·`worldbook:get`**；**第九轮新增：装配页头部必须讲清「插件覆盖 vs 本地覆盖」且点出「本地覆盖写的是角色 `index.json`」/ 头部不再出现 `CONTEXT RECIPE`、也不再重复一个 `h3` 标题 / 「带卡内世界书」默认勾选、取消勾选后 `withCardWorldbook=false` 必须随 `plan:import-file` 一起发出、重新勾选后为 `true` / 源码级不变量：角色卡导入不得再 `RemoveAll(Source=="native")`、必须走 `skippedByNative`、必须支持 `withCardWorldbook` 与 `MergeCardWorldBook`、必须用 `WorldBookFile` 规范化后再落盘 / 旧硬错误「没有可导入的提示词字段」必须消失、改为「没有任何可用文本」/ 快照卡片显示「含设定来源」、没抓到来源的明确写「只含装配配方」/ 快照说明块必须列出 `sources.tavernCard`·`sources.worldBook`·`sources.preset` / 导出弹窗列出随文件带走的设定来源 / 工具栏不再有「带卡内世界书」勾选框、`plan:import-file` 不得再带 `withCardWorldbook`（前端预判不了卡里有没有世界书） / 源码级不变量：`MergeCardWorldBook` 必须把原始 `cardBook` 传给 `MergeWorldBook`、不得出现 `NormalizeEntries(cardBook)`、必须有 `AskCardWorldbookAsync` + `MessageBoxOptions`、策略必须落到 `ImportOptions.json` / `EntryRows` 必须有形状守卫（`JArray direct`）、`MergeWorldBook` 形参必须叫 `incomingEntries`、必须有 `EntryTitles` / 酒馆兼容页「导入选项」默认「每次询问」、切换下拉框必须发 `import:options-save` 且说明文字跟着更新 / 角色卡导入完成弹窗必须说明卡内世界书怎么处理了 / 源码级不变量：世界书保存必须有 `StripShadowKeys` + `WorldBookShadowKeys`**、看门狗超时；**第十二轮新增：`ShrinkPlanForWire` 把 143 模块 / 9.9 万字的真实计划压进 448 KB 且**每个模块都还在**（id/name 完整）、缩水条数与被标记条数一致、每条都报全文长度 / 1 KB 极端预算下只缩正文不删模块 / `PackWorldBookRows` 首屏 40 条一条不少且整份落进预算 / 分页每页都是完整正文、不重不漏、`nextOffset` 一定前进（单条超整页也不会死循环）/ offset 语义精确 / 「装得下也要扣减预算」这条不变量（漏掉它缩水等于没做）；冒烟测试第 28h 组：预览标记含全文长度、完整模块不被误标、点「读取全文」只发一个 `plan:module`、预览编辑框 `readonly`、读回全文后恢复可写、读回后不被下一轮 `plan-state` 退回预览、世界书条目同样「标记 + 只读 + 读取全文」、面板顶部说明预览与未读回条数、「读取全部正文」从 offset 0 分页且读完后状态复位、第 28i 组：确认弹窗用的是插件自己的窄弹窗（不是原生对话框）、说明是哪张卡/多少条/预览标题/还有多少条/以后去哪里改策略、勾「记住我的选择」后回答 `accepted=true, remember=true`、关掉弹窗等价于「只要角色卡」且**同样回答后端**、无预览标题时不出空列表块、4 条源码级不变量（不得再出现 `Electron.Dialog.ShowMessageBoxAsync(`、必须有 `card-worldbook-ask`/`AskUiAsync`/`AnswerUiAsk`、必须处理窗口关闭、后端必须分发 `card-worldbook-answer`）；8 条源码级不变量（`readPlanFields` 跳过截断正文 / `keepLoadedModuleContent` / `continueWorldPaging` + `next > offset` / `worldEntryTruncated` / `ShrinkPlanForWire`+`PackWorldBookRows` 收在 `ContextStateBudget` / `else available -= cost` / `RestoreTruncatedModules` / 先 `SendPlan` 再 `plan-imported` / `PackWorldBookRows` 被 runtime 调用）；**第十三轮新增：`TavernImport.Greetings` 读出 `first_mes` + `alternate_greetings` 全集并按「开场白 / 开场白 2 / 开场白 3」编号、三种形状都能认、空串过滤、与首条重复的去掉、`GreetingMacro(1)=«{{greeting}}»`/`GreetingMacro(2)=«{{greeting2}}»`；`Environment` 暴露 `greeting2..N` / `alternateGreetings` / `greetingCount`；`Render` 的 `autoFillNames` 把未定义的宏填成宏名本身且带参数的只取名字（`{{random::a::b}}`→`random`）、不会盖掉真有取值的宏、不会复活注释宏、关掉后仍原样保留并回报；`ContextPlan.AutoMacros` 默认开、过 IPC 是 `autoMacros`、落盘（PascalCase）往返、老计划仍默认开；端到端编译出两种请求。冒烟测试第 28j 组：右栏搜索框在空态也常驻、搜模块名/正文/未参与装配标记、命中片段高亮、点结果选中模块 + 卡片 `.jump-flash`、跳转后清空搜索词、放大按钮隐藏四个前置字段且内容编辑器变高、再点还原、宏设置「自动宏应用」默认勾选 + 取消后随 `plan:save` 发回 `autoMacros=false`；5 条源码级不变量（`ContextPlan.AutoMacros = true` / `TavernImport` 读 `alternate_greetings` 且 `Greetings` 存在 / 导入角色卡走 `TavernImport.Greetings(card)` / `ContextCompiler` 有 `autoFillNames` 与 `greeting{n}` / 前端有 `moduleSearchMatches`·`jumpToModule`·`bindExpandEditor`）；**第十四轮新增第 28k 组：244 字的模块卡片不出现「预览 / 读取全文」徽标、真正超长的模块仍保留「预览 + 读取全文」、长正文的只读提示必须写明「超过 2000 字才会只下发预览」；4 条源码级不变量（`ContextStateBudget.MinKeepChars = 2000` / `FairCap`+`BinaryCap` 水填平 / 世界书分页 `NextOffset` 用 `start + list.Count` 不能用元数据游标 / 前端 `TRUNC_KEEP_CHARS = 2000`）；**第十五轮新增第 28l 组：自动后台拉全文必须**串行**（第一轮只发一个 `plan:module`，回包后才发下一个，`['a1'] → ['a1','a2'] → ['a1','a2','a4']`）、没被截的模块不进队列、状态栏显示「后台读取模块正文」进度、跑完一轮后计划里不再剩 `truncated`、装配页有「自动读取全文」开关、关掉后队列立刻停（不再发请求）、世界书首次下发有预览条目时自动从 offset 0 分页、内容全在预算内时不白跑一轮；4 条源码级不变量（`autoPlanFetching` 串行闸门 / `autoPlanTimer` 单条超时保护 / `resetAutoFetch` 能停队列 / `AUTO_FULLTEXT_KEY` 持久化开关）**）。
-- 未在运行中的 Alife 进行真实模型聊天；需重载后用自己的角色验证端到端体验。以下功能依赖真实环境，请重点确认：**激活第二个角色不再卡死**、**消息正文显示完整**（不再出现"截断成 400 字"）、**不再出现 `outbox REFUSED oversized`**（`character-bundle` 不应再涨到 500 KB+）、**不再出现小请求莫名 15 秒超时**（`outbox coalesced` 里只应出现 `state`）、**分页条能正常翻页**（"加载更早的 40 条"点下去条目增加、剩余数递减、归零后按钮消失）、自动侧装（关掉窗口后直接对话）、角色预设的读取/生效/导出/导入、**导入角色卡后「角色设定」分区不再消失**、**勾选「带卡内世界书」后世界书面板能看到卡里的条目**、**`某张卡.png` 这类特殊卡能导入**、本地覆盖写回 `index.json` 后不出现重复人物信息、原始记忆流编辑是否按预期改写实时上下文、**`trace.log` 里 `state push: ... bytes=` 的实际数值**（应远小于 1 MB；激活第二个角色前后都要看，这是判断这次修复是否真的生效的最直接证据）。
+- 未在运行中的 Alife 进行真实模型聊天；需重载后用自己的角色验证端到端体验。以下功能依赖真实环境，请重点确认：**激活第二个角色不再卡死**、**消息正文显示完整**（不再出现"截断成 400 字"）、**不再出现 `outbox REFUSED oversized`**（`character-bundle` 不应再涨到 500 KB+）、**不再出现小请求莫名 15 秒超时**（`outbox coalesced` 里只应出现 `state`）、**分页条能正常翻页**（"加载更早的 40 条"点下去条目增加、剩余数递减、归零后按钮消失）、自动侧装（关掉窗口后直接对话）、角色预设的读取/生效/导出/导入、**导入角色卡后「角色设定」分区不再消失**、**勾选「带卡内世界书」后世界书面板能看到卡里的条目**、**`Sgw_2-gemini.png` 这类特殊卡能导入**、本地覆盖写回 `index.json` 后不出现重复人物信息、原始记忆流编辑是否按预期改写实时上下文、**`trace.log` 里 `state push: ... bytes=` 的实际数值**（应远小于 1 MB；激活第二个角色前后都要看，这是判断这次修复是否真的生效的最直接证据）。
 
 ## IPC 桥为什么会整程序卡死
 
@@ -737,7 +1067,7 @@ io = new Server({ pingTimeout: 60000, pingInterval: 10000 });   // maxHttpBuffer
 
 | 部分 | 转义后字节 | 现在怎么处理 |
 | --- | --- | --- |
-| 装配计划 JSON（某角色 33 个模块） | 327 KB | 不内联，走 `plan:get` 按需下发 |
+| 装配计划 JSON（伊卡洛斯 33 个模块） | 327 KB | 不内联，走 `plan:get` 按需下发 |
 | 角色提示词 + 运行时系统消息 | ≈ 175 KB | 只给当前角色，超预算就丢，前端读 `index.json` / `native-prompt:get` |
 | **条目正文**（90 条实时消息全文） | **138 KB** | **原文发送，不截** |
 | 归档文件预览（46 个，本来就只发 180 字） | 30 KB | 原文发送（这是原本的设计） |
@@ -748,7 +1078,7 @@ io = new Server({ pingTimeout: 60000, pingInterval: 10000 });   // maxHttpBuffer
 还留 49% 余量。单元测试里有一条专门的回归断言，用这个真实形状（141 条、全文正文）
 断言 `!Degraded` 且没有任何一条被打上 `truncated`。
 
-但**余量不是方案**：真实数据是会长大的（某角色一天就有 114 条实时消息 + 83 个归档，
+但**余量不是方案**：真实数据是会长大的（星野雨一天就有 114 条实时消息 + 83 个归档，
 光元数据 190 KB、正文 219 KB；用一个月就是几千条）。所以第八轮的正解是
 **按预算装填 + 分页** —— 「一条报文最多多大」由预算硬保证，与用户用了多久无关。
 预算取 448 KB 是因为它同时满足两个条件：装得下"一个角色一天"的完整上下文（不误伤正文），
